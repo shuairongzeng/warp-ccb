@@ -6,6 +6,13 @@ import os
 import json
 import time
 
+# Fix Windows console encoding for Unicode output
+if sys.stdout and hasattr(sys.stdout, 'reconfigure'):
+    try:
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    except Exception:
+        pass
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "lib"))
 from bus_client import chain, pend
 
