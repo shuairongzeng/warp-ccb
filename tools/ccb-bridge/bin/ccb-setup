@@ -1,0 +1,286 @@
+#!/usr/bin/env python3
+"""ccb-setup — Install CCB Warp LocalAgentBus tools
+
+Adds ccb-bridge/bin to PATH and installs skills for Claude and Codex.
+"""
+
+import json
+import os
+import sys
+import shutil
+
+BRIDGE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
+BIN_DIR = os.path.join(BRIDGE_DIR, "bin")
+SKILLS_DIR = os.path.join(BRIDGE_DIR, "skills")
+
+# Skill content template — uses just command names (warp-ask, warp-ping, etc.)
+# so it works regardless of where ccb-bridge is installed, as long as bin/ is in PATH
+
+CLAUDE_SKILL = r'''---
+name: warp-ask
+description: Send a message to another AI agent via Warp LocalAgentBus and wait for reply. Use this to collaborate with other agents (claude/codex/gemini/opencode/droid). This is a BLOCKING call - it waits for the reply.
+metadata:
+  short-description: Send message to another agent and wait for reply
+---
+
+# Warp Ask - Cross-Agent Communication
+
+Send a message to another AI agent running in Warp and wait for the reply.
+
+## Available Agents
+
+- `claude` - Claude (Anthropic)
+- `codex` - Codex (OpenAI)
+- `gemini` - Gemini (Google)
+- `opencode` - OpenCode
+- `droid` - Droid
+
+## Multi-Instance Auto-Isolation
+
+Warp sets `WARP_BUS_PID` in every terminal. The `warp-ask` command uses this
+to automatically route messages to the correct Warp instance.
+
+## Step 1: Check Agent Status (MANDATORY)
+
+```powershell
+warp-ping $PROVIDER
+```
+
+If "not online", report that the agent is unavailable.
+
+## Step 2: Send Message (MANDATORY)
+
+```powershell
+warp-ask $PROVIDER "$MESSAGE" --wait --timeout 60
+```
+
+## Async Mode
+
+```powershell
+warp-ask $PROVIDER "$MESSAGE" --caller claude
+```
+
+Check later: `warp-pend $PROVIDER`
+
+## Examples
+
+- `warp-ping codex`
+- `warp-ask codex "What is 2+2?" --wait`
+'''
+
+CODEX_SKILL = r'''---
+name: warp-ask
+description: Send a message to another AI agent via Warp LocalAgentBus and wait for reply. Use this to collaborate with other agents (claude/codex/gemini/opencode/droid). This is a BLOCKING call - it waits for the reply.
+metadata:
+  short-description: Send message to another agent and wait for reply
+---
+
+# Warp Ask - Cross-Agent Communication
+
+Send a message to another AI agent running in Warp and wait for the reply.
+
+## Available Agents
+
+- `claude` - Claude (Anthropic)
+- `codex` - Codex (OpenAI)
+- `gemini` - Gemini (Google)
+- `opencode` - OpenCode
+- `droid` - Droid
+
+## Multi-Instance Auto-Isolation
+
+Warp sets `WARP_BUS_PID` in every terminal. The `warp-ask` command uses this
+to automatically route messages to the correct Warp instance.
+
+## Step 1: Check Agent Status (MANDATORY)
+
+```bash
+warp-ping $PROVIDER
+```
+
+If "not online", report that the agent is unavailable.
+
+## Step 2: Send Message (MANDATORY)
+
+```bash
+warp-ask $PROVIDER "$MESSAGE" --wait --timeout 60
+```
+
+## Async Mode
+
+```bash
+warp-ask $PROVIDER "$MESSAGE" --caller codex
+```
+
+Check later: `warp-pend $PROVIDER`
+
+## Examples
+
+- `warp-ping claude`
+- `warp-ask claude "What is 2+2?" --wait`
+'''
+
+CLAUDE_PING_SKILL = r'''---
+name: warp-ping
+description: Check if an AI agent is online in Warp. Always ping before using warp-ask.
+metadata:
+  short-description: Check AI agent online status
+---
+
+# Warp Ping - Check Agent Status
+
+Check if an AI agent is online and reachable via Warp LocalAgentBus.
+
+## Available Agents
+
+- `claude`, `codex`, `gemini`, `opencode`, `droid`
+
+## Execution (MANDATORY)
+
+```powershell
+warp-ping $PROVIDER
+```
+
+## Rules
+
+- Returns "connection OK" if online, "not online" if unavailable.
+- Always ping before sending messages with warp-ask.
+- If not online, do NOT attempt warp-ask.
+
+## Examples
+
+- `warp-ping codex`
+- `warp-ping claude`
+'''
+
+CODEX_PING_SKILL = r'''---
+name: warp-ping
+description: Check if an AI agent is online in Warp. Always ping before using warp-ask.
+metadata:
+  short-description: Check AI agent online status
+---
+
+# Warp Ping - Check Agent Status
+
+Check if an AI agent is online and reachable via Warp LocalAgentBus.
+
+## Available Agents
+
+- `claude`, `codex`, `gemini`, `opencode`, `droid`
+
+## Execution (MANDATORY)
+
+```bash
+warp-ping $PROVIDER
+```
+
+## Rules
+
+- Returns "connection OK" if online, "not online" if unavailable.
+- Always ping before sending messages with warp-ask.
+- If not online, do NOT attempt warp-ask.
+
+## Examples
+
+- `warp-ping claude`
+- `warp-ping codex`
+'''
+
+
+def install_skills():
+    """Install warp-ask and warp-ping skills for Claude and Codex."""
+    skills = [
+        ("warp-ask", CLAUDE_SKILL, CODEX_SKILL),
+        ("warp-ping", CLAUDE_PING_SKILL, CODEX_PING_SKILL),
+    ]
+    for skill_name, claude_content, codex_content in skills:
+        # Claude skill
+        claude_skill_dir = os.path.expanduser(f"~/.claude/skills/{skill_name}")
+        os.makedirs(claude_skill_dir, exist_ok=True)
+        with open(os.path.join(claude_skill_dir, "SKILL.md"), "w", encoding="utf-8") as f:
+            f.write(claude_content)
+        print(f"Installed Claude skill: {claude_skill_dir}")
+
+        # Codex skill
+        codex_skill_dir = os.path.expanduser(f"~/.codex/skills/{skill_name}")
+        os.makedirs(codex_skill_dir, exist_ok=True)
+        with open(os.path.join(codex_skill_dir, "SKILL.md"), "w", encoding="utf-8") as f:
+            f.write(codex_content)
+        print(f"Installed Codex skill: {codex_skill_dir}")
+
+
+def add_to_path_windows(bin_dir):
+    """Add bin_dir to user PATH on Windows."""
+    import winreg
+    key = winreg.OpenKey(
+        winreg.HKEY_CURRENT_USER,
+        r"Environment",
+        0,
+        winreg.KEY_READ | winreg.KEY_WRITE,
+    )
+    try:
+        path_val, path_type = winreg.QueryValueEx(key, "Path")
+    except FileNotFoundError:
+        path_val = ""
+        path_type = winreg.REG_EXPAND_SZ
+
+    # Normalize to forward slashes for comparison
+    normalized = path_val.replace("/", "\\")
+    if bin_dir.lower().replace("/", "\\") not in normalized.lower():
+        new_path = path_val + ";" + bin_dir if path_val else bin_dir
+        winreg.SetValueEx(key, "Path", 0, path_type, new_path)
+        print(f"Added to user PATH: {bin_dir}")
+        # Notify running shells
+        os.system(f"setx PATH \"{new_path}\" >nul 2>&1")
+    else:
+        print(f"Already in PATH: {bin_dir}")
+
+    winreg.CloseKey(key)
+
+
+def add_to_path_unix(bin_dir):
+    """Add bin_dir to user PATH on Unix via shell rc file."""
+    shell_rc = os.path.expanduser("~/.bashrc")
+    export_line = f'\nexport PATH="$PATH:{bin_dir}"\n'
+
+    if os.path.exists(shell_rc):
+        with open(shell_rc, "r") as f:
+            content = f.read()
+        if bin_dir not in content:
+            with open(shell_rc, "a") as f:
+                f.write(export_line)
+            print(f"Added to ~/.bashrc: {bin_dir}")
+        else:
+            print(f"Already in ~/.bashrc: {bin_dir}")
+    else:
+        with open(shell_rc, "w") as f:
+            f.write(export_line)
+        print(f"Created ~/.bashrc with PATH: {bin_dir}")
+
+
+def main():
+    print("=== CCB Warp LocalAgentBus Setup ===\n")
+
+    # Resolve absolute path for bin dir
+    bin_dir = os.path.abspath(BIN_DIR)
+    print(f"Bridge bin directory: {bin_dir}")
+
+    # 1. Add to PATH
+    print("\n[1/2] Adding to PATH...")
+    if sys.platform == "win32":
+        add_to_path_windows(bin_dir)
+    else:
+        add_to_path_unix(bin_dir)
+
+    # 2. Install skills
+    print("\n[2/2] Installing skills...")
+    install_skills()
+
+    print("\n=== Setup Complete ===")
+    print("Restart your terminal for PATH changes to take effect.")
+    print("Installed skills: warp-ask, warp-ping (for Claude and Codex)")
+    print("Then run: warp-ping claude")
+
+
+if __name__ == "__main__":
+    main()
