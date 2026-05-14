@@ -1,0 +1,51 @@
+#!/usr/bin/env python3
+"""warp-ping — Check CLI agent connectivity via Warp LocalAgentBus"""
+
+import sys
+import os
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "lib"))
+from bus_client import ping
+
+
+def main():
+    if len(sys.argv) < 2:
+        print("Usage: warp-ping <provider> [--cwd <dir>] [--session-id <id>]")
+        print("Providers: claude, codex, gemini, opencode, droid")
+        sys.exit(1)
+
+    provider = sys.argv[1]
+    cwd = None
+    session_id = None
+
+    i = 2
+    while i < len(sys.argv):
+        if sys.argv[i] == "--cwd" and i + 1 < len(sys.argv):
+            cwd = sys.argv[i + 1]
+            i += 2
+        elif sys.argv[i] == "--session-id" and i + 1 < len(sys.argv):
+            session_id = sys.argv[i + 1]
+            i += 2
+        else:
+            i += 1
+
+    try:
+        response = ping(provider, cwd=cwd, session_id=session_id)
+        if response.get("ok"):
+            online = response.get("online", False)
+            details = response.get("details", "")
+            session = response.get("session_id", "")
+            if online:
+                print(f"{provider} connection OK (session: {session or 'unknown'}, {details})")
+            else:
+                print(f"{provider} not online: {details}")
+        else:
+            print(f"Error: {response.get('message', 'unknown error')}", file=sys.stderr)
+            sys.exit(1)
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

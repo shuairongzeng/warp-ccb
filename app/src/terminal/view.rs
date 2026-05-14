@@ -4265,6 +4265,15 @@ impl TerminalView {
         };
         terminal_view.register_subscriptions_for_use_agent_footer(ctx);
 
+        // Register this terminal view with LocalAgentBus for auto-launch support.
+        {
+            let view_id = terminal_view.view_id;
+            let weak_handle = ctx.handle();
+            crate::ai::local_agent_bus::LocalAgentBusModel::handle(ctx).update(ctx, |bus, _ctx| {
+                bus.register_terminal_handle(view_id, weak_handle);
+            });
+        }
+
         // Forward RemoteServerManager setup events into the terminal event stream
         // so the ModelEventDispatcher can gate session initialization on them.
         if FeatureFlag::SshRemoteServer.is_enabled() {
@@ -10664,6 +10673,21 @@ impl TerminalView {
             ModelEvent::BlockCompleted(block_completed_event) => {
                 record_trace_event!("command_execution:block_completed");
                 end_trace_after_next!("window:redraw:end");
+
+                // Check for CCB_DONE markers in block output.
+                if let BlockType::User(completed) = &block_completed_event.block_type {
+                    let output = &completed.output_truncated_with_obfuscated_secrets;
+                    if output.contains("CCB_DONE:") {
+                        let view_id = self.view_id;
+                        crate::ai::local_agent_bus::LocalAgentBusModel::handle(ctx).update(
+                            ctx,
+                            |bus, _ctx| {
+                                bus.check_block_output_for_done(view_id, output);
+                            },
+                        );
+                    }
+                }
+
                 let block_completed_event_clone = block_completed_event.clone();
                 self.input.update(ctx, |input, ctx| {
                     input.handle_block_completed_event(block_completed_event_clone, ctx);
@@ -10743,6 +10767,12 @@ impl TerminalView {
                     CLIAgentSessionsModel::handle(ctx).update(ctx, |sessions_model, ctx| {
                         sessions_model.remove_session(self.view_id, ctx);
                     });
+                    crate::ai::local_agent_bus::LocalAgentBusModel::handle(ctx).update(
+                        ctx,
+                        |bus, _ctx| {
+                            bus.deregister_terminal_handle(self.view_id);
+                        },
+                    );
                 }
 
                 let next_block_index = block_completed_event.block_index + BlockIndex::from(1);
@@ -10947,6 +10977,13 @@ impl TerminalView {
                                             _ => {}
                                         },
                                     );
+
+                                    // Register terminal handle with LocalAgentBus
+                                    // for prompt injection (command detection path).
+                                    let bus_handle = ctx.handle();
+                                    crate::ai::local_agent_bus::LocalAgentBusModel::handle(ctx).update(ctx, |bus, _ctx| {
+                                        bus.register_terminal_handle(view_id, bus_handle);
+                                    });
 
                                     // Codex doesn't use the sentinel-based plugin protocol,
                                     // so create the listener proactively on command detection
@@ -12126,6 +12163,14 @@ impl TerminalView {
         if !is_agent_supported(&notification.agent) {
             return false;
         }
+
+        // Register terminal handle with LocalAgentBus for prompt injection,
+        // regardless of whether the listener already exists.
+        let bus_handle = ctx.handle();
+        crate::ai::local_agent_bus::LocalAgentBusModel::handle(ctx).update(ctx, |bus, _ctx| {
+            bus.register_terminal_handle(self.view_id, bus_handle);
+        });
+
         let has_listener = CLIAgentSessionsModel::as_ref(ctx)
             .session(self.view_id)
             .is_some_and(|s| s.listener.is_some());
@@ -12158,6 +12203,7 @@ impl TerminalView {
                 ctx,
             );
         });
+
         true
     }
 

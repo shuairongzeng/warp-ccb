@@ -541,6 +541,24 @@ impl CLIAgentSessionsModel {
         self.plugin_auto_failures
             .contains(&(agent, remote_host.clone()))
     }
+
+    /// Iterate over all tracked sessions, yielding (terminal_view_id, agent, &session).
+    #[allow(dead_code)]
+    pub fn iter_sessions(&self) -> impl Iterator<Item = (EntityId, CLIAgent, &CLIAgentSession)> {
+        self.sessions.iter().map(|(&id, s)| (id, s.agent, s))
+    }
+
+    /// Find sessions matching a specific agent type.
+    #[allow(dead_code)]
+    pub fn find_by_agent(
+        &self,
+        agent: CLIAgent,
+    ) -> impl Iterator<Item = (EntityId, &CLIAgentSession)> {
+        self.sessions
+            .iter()
+            .filter(move |(_, s)| s.agent == agent)
+            .map(|(&id, s)| (id, s))
+    }
 }
 
 #[cfg(test)]

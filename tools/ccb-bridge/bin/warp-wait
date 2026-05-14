@@ -1,0 +1,56 @@
+#!/usr/bin/env python3
+"""warp-wait — Block until a CLI agent request completes"""
+
+import sys
+import os
+import json
+
+# Fix Windows console encoding for Unicode output
+if sys.stdout and hasattr(sys.stdout, 'reconfigure'):
+    try:
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    except Exception:
+        pass
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "lib"))
+from bus_client import wait
+
+
+def main():
+    if len(sys.argv) < 2:
+        print("Usage: warp-wait <req_id> [--timeout N]")
+        print("  Waits for a request to complete, then prints the result.")
+        print("  Default timeout: 300 seconds (5 minutes)")
+        sys.exit(1)
+
+    req_id = sys.argv[1]
+    timeout = 300
+
+    i = 2
+    while i < len(sys.argv):
+        if sys.argv[i] == "--timeout" and i + 1 < len(sys.argv):
+            timeout = int(sys.argv[i + 1])
+            i += 2
+        else:
+            i += 1
+
+    try:
+        response = wait(req_id=req_id, timeout=timeout)
+        if response.get("ok"):
+            data = response
+            status = data.get("status", "unknown")
+            content = data.get("content", "")
+            elapsed = data.get("elapsed_ms", 0)
+            print(f"[{data.get('req_id', '?')}] ({status}) {elapsed}ms")
+            if content:
+                print(content)
+        else:
+            print(f"Error: {response.get('message', 'unknown error')}", file=sys.stderr)
+            sys.exit(1)
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

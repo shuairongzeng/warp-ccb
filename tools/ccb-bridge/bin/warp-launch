@@ -1,0 +1,48 @@
+#!/usr/bin/env python3
+"""warp-launch — Launch a new CLI agent session via Warp LocalAgentBus"""
+
+import sys
+import os
+import json
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "lib"))
+from bus_client import launch
+
+
+def main():
+    if len(sys.argv) < 2:
+        print("Usage: warp-launch <provider> [prompt] [--cwd <dir>]")
+        print("Providers: claude, codex, gemini, opencode, droid")
+        sys.exit(1)
+
+    provider = sys.argv[1]
+    prompt = None
+    cwd = None
+
+    i = 2
+    while i < len(sys.argv):
+        if sys.argv[i] == "--cwd" and i + 1 < len(sys.argv):
+            cwd = sys.argv[i + 1]
+            i += 2
+        elif prompt is None:
+            prompt = sys.argv[i]
+            i += 1
+        else:
+            i += 1
+
+    try:
+        response = launch(provider, prompt=prompt, cwd=cwd)
+        if response.get("ok"):
+            tid = response.get("terminal_view_id", "?")
+            sid = response.get("session_id", "")
+            print(f"Launched {provider} (terminal: {tid}, session: {sid or 'pending'})")
+        else:
+            print(f"Error: {response.get('message', 'unknown error')}", file=sys.stderr)
+            sys.exit(1)
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

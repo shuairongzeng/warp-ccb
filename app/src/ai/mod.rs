@@ -48,6 +48,8 @@ pub mod facts;
 pub(crate) mod generate_block_title;
 pub(crate) mod generate_code_review_content;
 pub(crate) mod loading;
+#[cfg(not(target_family = "wasm"))]
+pub mod local_agent_bus;
 pub mod mcp;
 pub mod outline;
 

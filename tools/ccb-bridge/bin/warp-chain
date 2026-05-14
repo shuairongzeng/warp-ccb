@@ -1,0 +1,65 @@
+#!/usr/bin/env python3
+"""warp-chain — Execute a chain of agent steps via Warp LocalAgentBus"""
+
+import sys
+import os
+import json
+import time
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "lib"))
+from bus_client import chain, pend
+
+
+def main():
+    if len(sys.argv) < 3:
+        print("Usage: warp-chain <provider1:prompt1> <provider2:prompt2> [...]")
+        print("  Each argument is provider:prompt")
+        print("  Example: warp-chain 'claude:analyze this code' 'claude:review the analysis'")
+        print()
+        print("Use --chain-id <id> to query a running chain.")
+        sys.exit(1)
+
+    # Check if querying existing chain
+    if sys.argv[1] == "--chain-id" and len(sys.argv) >= 3:
+        chain_id = sys.argv[2]
+        result = pend("claude", chain_id=chain_id)
+        chain_data = result.get("chain")
+        if chain_data:
+            print(f"Chain: {chain_data['chain_id']}")
+            print(f"Status: {chain_data['status']} ({chain_data['current_step']}/{chain_data['total_steps']})")
+            for step in chain_data.get("steps", []):
+                content_preview = step["content"][:100] + "..." if len(step["content"]) > 100 else step["content"]
+                print(f"  Step {step['step']} ({step['provider']}): {step['status']}")
+                if content_preview:
+                    print(f"    {content_preview}")
+        else:
+            print(f"Chain {chain_id} not found")
+        return
+
+    # Parse steps
+    steps = []
+    for arg in sys.argv[1:]:
+        if ":" in arg:
+            provider, prompt = arg.split(":", 1)
+            steps.append({"provider": provider, "prompt": prompt})
+        else:
+            print(f"Invalid step format: {arg} (expected provider:prompt)", file=sys.stderr)
+            sys.exit(1)
+
+    try:
+        response = chain(steps)
+        if response.get("ok"):
+            chain_id = response.get("chain_id", "?")
+            step_count = response.get("step_count", 0)
+            print(f"Chain started: {chain_id} ({step_count} steps)")
+            print(f"  Monitor: warp-chain --chain-id {chain_id}")
+        else:
+            print(f"Error: {response.get('message', 'unknown error')}", file=sys.stderr)
+            sys.exit(1)
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

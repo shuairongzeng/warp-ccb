@@ -132,6 +132,8 @@ pub mod themes;
 use crate::ai::active_agent_views_model::ActiveAgentViewsModel;
 #[cfg(not(target_family = "wasm"))]
 use crate::ai::aws_credentials::AwsCredentialRefresher as _;
+#[cfg(not(target_family = "wasm"))]
+use crate::ai::local_agent_bus::LocalAgentBusModel;
 use crate::ai::mcp::FileBasedMCPManager;
 use crate::ai::mcp::FileMCPWatcher;
 use crate::uri::web_intent_parser::maybe_rewrite_web_url_to_intent;
@@ -1669,6 +1671,25 @@ pub(crate) fn initialize_app(
     }
     ctx.add_singleton_model(move |_| RestoredAgentConversations::new(multi_agent_conversations));
     ctx.add_singleton_model(|_| CLIAgentSessionsModel::new());
+
+    // LocalAgentBus: CCB multi-agent communication bridge.
+    #[cfg(not(target_family = "wasm"))]
+    {
+        let bus_dir = dirs::data_local_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+            .join("warp-ccb");
+        ctx.add_singleton_model(move |ctx| match LocalAgentBusModel::new(&bus_dir) {
+            Ok(mut model) => {
+                model.start_command_poll(ctx);
+                model
+            }
+            Err(e) => {
+                log::error!("Failed to initialize LocalAgentBus: {}", e);
+                panic!("LocalAgentBus initialization failed: {}", e);
+            }
+        });
+    }
+
     // ActiveAgentViewsModel is used to track active agent conversations and notify listeners when they change.
     ctx.add_singleton_model(|_| ActiveAgentViewsModel::new());
     ctx.add_singleton_model(AgentNotificationsModel::new);

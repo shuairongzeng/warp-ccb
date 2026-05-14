@@ -3772,6 +3772,14 @@ impl PaneGroup {
             pane_group.register_pending_ambient_restorations(pending, ctx);
         }
 
+        // Register this PaneGroup with LocalAgentBus for auto-launch support.
+        {
+            let weak_pg = ctx.handle();
+            crate::ai::local_agent_bus::LocalAgentBusModel::handle(ctx).update(ctx, |bus, _ctx| {
+                bus.register_pane_group_handle(weak_pg);
+            });
+        }
+
         pane_group
     }
 
@@ -4227,6 +4235,23 @@ impl PaneGroup {
         let new_pane_id = pane_data.terminal_pane_id();
         self.attach_child_pane_off_tree(Box::new(pane_data), ctx);
         new_pane_id
+    }
+
+    /// Public entry point for LocalAgentBus to create a hidden child agent pane.
+    /// Returns the new terminal's EntityId and ViewHandle, or None if no base pane found.
+    pub fn create_agent_terminal_for_bus(
+        &mut self,
+        ctx: &mut ViewContext<Self>,
+    ) -> Option<(EntityId, ViewHandle<TerminalView>)> {
+        let new_pane_id = self.add_terminal_pane(Direction::Right, None, ctx);
+        log::info!("PaneGroup: created agent terminal pane via split: {:?}", new_pane_id);
+
+        let pane_id: PaneId = new_pane_id.into();
+        let pane_content = self.pane_contents.get(&pane_id)?;
+        let terminal_pane = pane_content.as_any().downcast_ref::<TerminalPane>()?;
+        let view_handle = terminal_pane.terminal_view(ctx);
+        let entity_id = view_handle.id();
+        Some((entity_id, view_handle))
     }
 
     /// Creates a cloud-mode pane that lives off-tree as a child agent pane.
