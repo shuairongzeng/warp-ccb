@@ -136,11 +136,19 @@ impl LocalAgentBusModel {
             created_at_ms,
         };
 
-        let addr_path = base_dir_for_addr.join("bus-address.json");
         let addr_json = serde_json::to_string_pretty(&addr_info)?;
-        std::fs::write(&addr_path, addr_json)?;
+        // Write the default bus-address.json for backward compatibility
+        let default_path = base_dir_for_addr.join("bus-address.json");
+        let _ = std::fs::write(&default_path, &addr_json);
+        // Also write a per-PID file for multi-instance support
+        let pid_path = base_dir_for_addr.join(format!("bus-address-{}.json", pid));
+        std::fs::write(&pid_path, addr_json)?;
 
-        log::info!("LocalAgentBus initialized at {}", actual_socket_path);
+        log::info!(
+            "LocalAgentBus initialized at {} (pid={})",
+            actual_socket_path,
+            pid
+        );
 
         Ok(Self {
             socket_path: actual_socket_path,

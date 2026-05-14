@@ -61,7 +61,7 @@ def main():
 
         if do_wait:
             print(f"[{req_id}] waiting for {provider}...")
-            result = wait(req_id=req_id, timeout=wait_timeout)
+            result = wait(req_id=req_id, timeout=wait_timeout, cwd=cwd)
             if result.get("ok"):
                 status = result.get("status", "unknown")
                 content = result.get("content", "")

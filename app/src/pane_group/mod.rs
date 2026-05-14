@@ -4244,7 +4244,10 @@ impl PaneGroup {
         ctx: &mut ViewContext<Self>,
     ) -> Option<(EntityId, ViewHandle<TerminalView>)> {
         let new_pane_id = self.add_terminal_pane(Direction::Right, None, ctx);
-        log::info!("PaneGroup: created agent terminal pane via split: {:?}", new_pane_id);
+        log::info!(
+            "PaneGroup: created agent terminal pane via split: {:?}",
+            new_pane_id
+        );
 
         let pane_id: PaneId = new_pane_id.into();
         let pane_content = self.pane_contents.get(&pane_id)?;
@@ -6475,11 +6478,16 @@ impl PaneGroup {
     fn create_terminal_pane_data(
         &self,
         startup_directory: Option<PathBuf>,
-        env_vars: HashMap<OsString, OsString>,
+        mut env_vars: HashMap<OsString, OsString>,
         chosen_shell: Option<AvailableShell>,
         conversation_restoration: Option<ConversationRestorationInNewPaneType>,
         ctx: &mut ViewContext<Self>,
     ) -> (TerminalPane, ViewHandle<TerminalView>) {
+        // Inject WARP_BUS_PID so child terminals can find the correct bus instance
+        env_vars.insert(
+            OsString::from("WARP_BUS_PID"),
+            OsString::from(std::process::id().to_string()),
+        );
         let uuid = Uuid::new_v4();
         let resources = TerminalViewResources {
             tips_completed: self.tips_completed.clone(),
