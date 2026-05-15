@@ -250,6 +250,11 @@ fn is_terminal_ui_line(line: &str) -> bool {
         || lower.starts_with("yolo  agent")
         || lower.starts_with("yolo agent")
         || lower.contains(" agent (kimi-")
+        || lower == ">"
+        || lower.starts_with('›')
+        || (lower.starts_with("gpt-") && lower.contains(" · "))
+        || lower.contains("ready (restart to apply)")
+        || (lower.starts_with("glm-") && lower.contains(" - openai"))
     {
         return true;
     }
@@ -402,6 +407,44 @@ mod tests {
 ───────────────────────────────────────────────────────────
 yolo  agent (Kimi-k2.6 ●)  D:\\GitHub\\warp-ccb
                                context: 4.9% (12.8k/262.1k)";
+        assert!(tracker.check_done_marker(req_id, output));
+    }
+
+    #[test]
+    fn test_done_marker_allows_droid_status_footer_after_end() {
+        let tracker = CompletionTracker::new();
+        let req_id = "20260515-212919-2ba19670";
+        let output = "\
+⛬  [CCB_START:reply-20260515-212919-2ba1
+   9670]
+   你好！我是 Droid，一个由 Factory 构建的 AI 软件工程代理。
+   [CCB_END:reply-20260515-212919-2ba196
+   70]
+
+GLM-5.1 [GLM Coding Plan China] - Openai […]
+
+ >
+
+[⏱ 21s] ✓ v0.126.0 ready (restart to apply)";
+        assert!(tracker.check_done_marker(req_id, output));
+    }
+
+    #[test]
+    fn test_done_marker_allows_codex_status_footer_after_end() {
+        let tracker = CompletionTracker::new();
+        let req_id = "20260515-223836-3484bb45";
+        let output = "\
+• [CCB_START:reply-20260515-223836-
+  3484bb45]
+  我是 Codex，一个在你当前工作区内协作的 AI 编程助手。
+  [CCB_END:reply-20260515-223836-3484bb45]
+
+───────────────────────────────────────────
+
+
+› Explain this codebase
+
+  gpt-5.5 xhigh · D:\\GitHub\\warp-ccb";
         assert!(tracker.check_done_marker(req_id, output));
     }
 

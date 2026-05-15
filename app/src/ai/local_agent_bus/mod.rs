@@ -324,26 +324,16 @@ impl LocalAgentBusModel {
                 for req_id in &req_ids {
                     let marker_ids = completion::reply_marker_ids(req_id);
                     let has_start = marker_ids.iter().any(|marker_id| {
-                        !completion::find_unwrapped_ccb_tag_ranges(
-                            &output,
-                            "CCB_START",
-                            marker_id,
-                        )
-                        .is_empty()
+                        !completion::find_unwrapped_ccb_tag_ranges(&output, "CCB_START", marker_id)
+                            .is_empty()
                     });
                     let has_end = marker_ids.iter().any(|marker_id| {
-                        !completion::find_unwrapped_ccb_tag_ranges(
-                            &output,
-                            "CCB_END",
-                            marker_id,
-                        )
-                        .is_empty()
+                        !completion::find_unwrapped_ccb_tag_ranges(&output, "CCB_END", marker_id)
+                            .is_empty()
                     });
                     let has_terminal_end = marker_ids.iter().any(|marker_id| {
                         completion::find_terminal_unwrapped_ccb_tag_range(
-                            &output,
-                            "CCB_END",
-                            marker_id,
+                            &output, "CCB_END", marker_id,
                         )
                         .is_some()
                     });
@@ -408,8 +398,16 @@ impl LocalAgentBusModel {
                             req_id
                         );
                         // Debug: write scan output
-                        let debug_path = std::env::temp_dir().join(format!("ccb_scan_{}.txt", req_id));
-                        let _ = std::fs::write(&debug_path, format!("REPLY_LEN={}\n---OUTPUT---\n{}\n---END---", reply.len(), output));
+                        let debug_path =
+                            std::env::temp_dir().join(format!("ccb_scan_{}.txt", req_id));
+                        let _ = std::fs::write(
+                            &debug_path,
+                            format!(
+                                "REPLY_LEN={}\n---OUTPUT---\n{}\n---END---",
+                                reply.len(),
+                                output
+                            ),
+                        );
                         // Don't finalize if reply is empty — let next tick retry
                         if !will_finalize {
                             write_reply_capture_debug_file(
@@ -454,7 +452,10 @@ impl LocalAgentBusModel {
             // the launch is successful and the terminal is ready for asks.
             if req_id.starts_with("launch-") && req.status == RequestStatus::Injecting {
                 let view_id = req.terminal_view_id;
-                if sessions_model.session(view_id).is_some() {
+                if sessions_model.session(view_id).is_some()
+                    || (self.bus_launched_sessions.contains_key(&view_id)
+                        && self.terminal_handles.contains_key(&view_id))
+                {
                     launches_resolved.push(req_id.clone());
                 }
                 continue;
@@ -504,7 +505,10 @@ impl LocalAgentBusModel {
             // If reply is still empty, terminal output may not be fully rendered yet.
             // Don't finalize — let the next tick retry capture.
             if reply_text.is_empty() {
-                log::info!("LocalAgentBus: reply still empty for req {}, will retry next tick", req_id);
+                log::info!(
+                    "LocalAgentBus: reply still empty for req {}, will retry next tick",
+                    req_id
+                );
                 continue;
             }
             self.finalize_request_with_reply(
@@ -565,7 +569,11 @@ impl LocalAgentBusModel {
             // Debug: write terminal output to file for diagnosis
             let debug_path = std::env::temp_dir().join(format!("ccb_capture_{}.txt", req_id));
             let _ = std::fs::write(&debug_path, &output);
-            log::info!("CCB_DEBUG: wrote {} chars to {:?}", output.len(), debug_path);
+            log::info!(
+                "CCB_DEBUG: wrote {} chars to {:?}",
+                output.len(),
+                debug_path
+            );
 
             let reply = extract_reply(req_id, &output);
             if !reply.is_empty() {
@@ -1123,7 +1131,11 @@ impl LocalAgentBusModel {
                 schema_version: store::StoredResponse::SCHEMA_VERSION,
             };
             if let Err(e) = self.store.write(&stored) {
-                log::warn!("LocalAgentBus: failed to persist response for {}: {}", req_id, e);
+                log::warn!(
+                    "LocalAgentBus: failed to persist response for {}: {}",
+                    req_id,
+                    e
+                );
             }
         }
     }
@@ -1131,7 +1143,9 @@ impl LocalAgentBusModel {
     /// Extract callback_provider from caller field.
     /// Returns Some(caller) if caller is a known provider name and different from the target provider.
     fn extract_callback(caller: &str, provider: &str) -> Option<String> {
-        let known_providers = ["claude", "codex", "gemini", "opencode", "droid", "kimi", "goose"];
+        let known_providers = [
+            "claude", "codex", "gemini", "opencode", "droid", "kimi", "goose",
+        ];
         if known_providers.contains(&caller) && caller != provider {
             Some(caller.to_string())
         } else {
@@ -1205,12 +1219,20 @@ impl LocalAgentBusModel {
                     );
                     return;
                 }
-            }
+            },
         };
 
         // Write debug info
         let debug_path = std::env::temp_dir().join(format!("ccb_callback_{}.txt", req_id));
-        let _ = std::fs::write(&debug_path, format!("from={}\nreply_len={}\nreply={}\n", from_provider, reply.len(), reply));
+        let _ = std::fs::write(
+            &debug_path,
+            format!(
+                "from={}\nreply_len={}\nreply={}\n",
+                from_provider,
+                reply.len(),
+                reply
+            ),
+        );
 
         // Format callback as a clear, natural-language prompt that CLI agents can understand.
         // This is sent as a new "ask" so the sender agent processes it like user input.
@@ -2150,10 +2172,7 @@ fn collect_reply_capture_diagnostics(req_id: &str, output: &str) -> ReplyCapture
         .match_indices(&start_tag)
         .map(|(pos, _)| pos)
         .collect();
-    let end_positions: Vec<usize> = output
-        .match_indices(&end_tag)
-        .map(|(pos, _)| pos)
-        .collect();
+    let end_positions: Vec<usize> = output.match_indices(&end_tag).map(|(pos, _)| pos).collect();
 
     ReplyCaptureDiagnostics {
         output_len: output.len(),
@@ -2199,12 +2218,7 @@ fn log_reply_capture_attempt(
     );
 }
 
-fn write_reply_capture_debug_file(
-    req_id: &str,
-    source: CaptureSource,
-    output: &str,
-    reply: &str,
-) {
+fn write_reply_capture_debug_file(req_id: &str, source: CaptureSource, output: &str, reply: &str) {
     let diag = collect_reply_capture_diagnostics(req_id, output);
     let debug_path = std::env::temp_dir().join(format!(
         "ccb_capture_{}_{}.txt",
@@ -2251,7 +2265,11 @@ fn debug_prefix(input: &str, max_chars: usize) -> String {
 /// Strategy 1: find the terminal [CCB_START:xxx]...[CCB_END:xxx] pair.
 /// Strategy 2: find CCB_DONE:xxx fallback.
 fn extract_reply(req_id: &str, output: &str) -> String {
-    log::info!("CCB_DEBUG extract_reply: req_id={}, output_len={}", req_id, output.len());
+    log::info!(
+        "CCB_DEBUG extract_reply: req_id={}, output_len={}",
+        req_id,
+        output.len()
+    );
 
     let start_tag = format!("[CCB_START:{}]", req_id);
     let end_tag = format!("[CCB_END:{}]", req_id);
@@ -2284,7 +2302,8 @@ fn extract_reply(req_id: &str, output: &str) -> String {
             continue;
         }
 
-        let start_ranges = completion::find_unwrapped_ccb_tag_ranges(output, "CCB_START", marker_id);
+        let start_ranges =
+            completion::find_unwrapped_ccb_tag_ranges(output, "CCB_START", marker_id);
         if let Some((_, content_start)) = start_ranges
             .iter()
             .rev()
@@ -2318,22 +2337,34 @@ fn extract_reply(req_id: &str, output: &str) -> String {
         // Skip if this marker is wrapped in backticks (instruction text)
         let preceded_by_backtick = start_pos > 0 && output.as_bytes()[start_pos - 1] == b'`';
         let after_start = start_pos + start_tag.len();
-        let followed_by_backtick = after_start < output.len() && output.as_bytes()[after_start] == b'`';
+        let followed_by_backtick =
+            after_start < output.len() && output.as_bytes()[after_start] == b'`';
         if preceded_by_backtick || followed_by_backtick {
-            log::info!("CCB_DEBUG: skipping backtick-wrapped start_tag at pos {}", start_pos);
+            log::info!(
+                "CCB_DEBUG: skipping backtick-wrapped start_tag at pos {}",
+                start_pos
+            );
             search_from = start_pos;
             continue;
         }
 
         // Find the line containing this match
         let line_start = output[..start_pos].rfind('\n').map(|p| p + 1).unwrap_or(0);
-        let line_end = output[start_pos..].find('\n').map(|p| start_pos + p).unwrap_or(output.len());
+        let line_end = output[start_pos..]
+            .find('\n')
+            .map(|p| start_pos + p)
+            .unwrap_or(output.len());
         let line = &output[line_start..line_end];
 
-        log::info!("CCB_DEBUG: found start_tag at pos {}, line: {:?}", start_pos, line);
+        log::info!(
+            "CCB_DEBUG: found start_tag at pos {}, line: {:?}",
+            start_pos,
+            line
+        );
 
         // Skip instruction lines (old format)
-        if line.contains("Before your final reply") || line.contains("After your final reply")
+        if line.contains("Before your final reply")
+            || line.contains("After your final reply")
             || line.contains("Reply using exactly this format")
         {
             log::info!("CCB_DEBUG: skipping instruction line");
@@ -2352,7 +2383,8 @@ fn extract_reply(req_id: &str, output: &str) -> String {
                     let abs = end_search + pos;
                     let pre_backtick = abs > 0 && remaining.as_bytes()[abs - 1] == b'`';
                     let after_end = abs + end_tag.len();
-                    let post_backtick = after_end < remaining.len() && remaining.as_bytes()[after_end] == b'`';
+                    let post_backtick =
+                        after_end < remaining.len() && remaining.as_bytes()[after_end] == b'`';
                     if !pre_backtick && !post_backtick {
                         break Some(abs);
                     }
@@ -2365,7 +2397,8 @@ fn extract_reply(req_id: &str, output: &str) -> String {
                 let reply = remaining[..end_pos].trim();
                 log::info!("CCB_DEBUG: found end_tag, reply_len={}", reply.len());
                 // Skip if content is instruction text
-                if reply.contains("on its own line") || reply.contains("After your final reply")
+                if reply.contains("on its own line")
+                    || reply.contains("After your final reply")
                     || reply.contains("Reply using exactly this format")
                     || reply.contains("without backticks")
                     || reply.contains("<your reply>")
@@ -2432,7 +2465,10 @@ fn extract_reply(req_id: &str, output: &str) -> String {
             }
         };
         if let Some(end_pos) = naked_end {
-            log::info!("CCB_DEBUG: START not found but naked END found at pos {}, using fallback", end_pos);
+            log::info!(
+                "CCB_DEBUG: START not found but naked END found at pos {}, using fallback",
+                end_pos
+            );
             let before_end = &output[..end_pos];
             let mut candidate = before_end.trim_end();
             for _ in 0..10 {
@@ -2484,7 +2520,8 @@ mod tests {
 
     #[test]
     fn test_extract_reply_new_format_multiline() {
-        let output = "lots of intermediate output\n[CCB_START:xyz]\nLine 1\nLine 2\nLine 3\n[CCB_END:xyz]\n";
+        let output =
+            "lots of intermediate output\n[CCB_START:xyz]\nLine 1\nLine 2\nLine 3\n[CCB_END:xyz]\n";
         let reply = extract_reply("xyz", output);
         assert_eq!(reply, "Line 1\nLine 2\nLine 3");
     }
@@ -2537,8 +2574,16 @@ mod tests {
             \n\
             [CCB_END:20260514-195447-8c242b0c]";
         let reply = extract_reply("20260514-195447-8c242b0c", output);
-        assert!(reply.contains("在复杂任务面前"), "should extract actual reply, got: {:?}", reply);
-        assert!(!reply.contains("backticks"), "should NOT contain instruction text, got: {:?}", reply);
+        assert!(
+            reply.contains("在复杂任务面前"),
+            "should extract actual reply, got: {:?}",
+            reply
+        );
+        assert!(
+            !reply.contains("backticks"),
+            "should NOT contain instruction text, got: {:?}",
+            reply
+        );
     }
 
     #[test]
@@ -2554,7 +2599,11 @@ mod tests {
             Hello, I am an AI assistant.\n\
             Nice to meet you!";
         let reply = extract_reply("abc123", output);
-        assert_eq!(reply, "", "should return empty when agent didn't output markers, got: {:?}", reply);
+        assert_eq!(
+            reply, "",
+            "should return empty when agent didn't output markers, got: {:?}",
+            reply
+        );
     }
 
     #[test]
@@ -2573,14 +2622,23 @@ mod tests {
             \n\
             [CCB_END:droid-test]";
         let reply = extract_reply("droid-test", output);
-        assert!(reply.contains("我是 Droid"), "should extract actual reply, got: {:?}", reply);
-        assert!(!reply.contains("backticks"), "should NOT contain instruction text, got: {:?}", reply);
+        assert!(
+            reply.contains("我是 Droid"),
+            "should extract actual reply, got: {:?}",
+            reply
+        );
+        assert!(
+            !reply.contains("backticks"),
+            "should NOT contain instruction text, got: {:?}",
+            reply
+        );
     }
 
     #[test]
     fn test_extract_reply_wrapped_end_marker_id() {
         let req_id = "20260515-130313-6aea5fe7";
-        let output = "• [CCB_START:20260515-130313-6aea5fe7] kimi 你好 [CCB_END:20\n260515-130313-6aea5fe7]";
+        let output =
+            "• [CCB_START:20260515-130313-6aea5fe7] kimi 你好 [CCB_END:20\n260515-130313-6aea5fe7]";
         let reply = extract_reply(req_id, output);
         assert_eq!(reply, "kimi 你好");
     }
@@ -2637,9 +2695,73 @@ mod tests {
 yolo  agent (Kimi-k2.6 ●)  D:\\GitHub\\warp-ccb
                                context: 4.9% (12.8k/262.1k)";
         let reply = extract_reply(req_id, output);
-        assert!(reply.contains("你好！我是 Kimi Code CLI。"), "got: {:?}", reply);
+        assert!(
+            reply.contains("你好！我是 Kimi Code CLI。"),
+            "got: {:?}",
+            reply
+        );
         assert!(reply.contains("协助你完成软件工程任务"), "got: {:?}", reply);
         assert!(!reply.contains("yolo  agent"), "got: {:?}", reply);
+    }
+
+    #[test]
+    fn test_extract_reply_allows_droid_status_footer() {
+        let req_id = "20260515-212919-2ba19670";
+        let output = "\
+⛬  [CCB_START:reply-20260515-212919-2ba1
+   9670]
+   你好！我是 Droid，一个由 Factory
+   构建的 AI 软件工程代理。我可以帮助你
+   完成各种软件工程任务，包括：
+
+   •  阅读、编写和编辑代码
+   •  搜索和探索代码库
+   •  调试和修复问题
+
+   我当前工作在 `D:\\GitHub\\warp-ccb`
+   项目目录下。有什么我可以帮你的吗？
+   [CCB_END:reply-20260515-212919-2ba196
+   70]
+
+GLM-5.1 [GLM Coding Plan China] - Openai […]
+
+ >
+
+[⏱ 21s] ✓ v0.126.0 ready (restart to apply)";
+        let reply = extract_reply(req_id, output);
+        assert!(reply.contains("你好！我是 Droid"), "got: {:?}", reply);
+        assert!(reply.contains("完成各种软件工程任务"), "got: {:?}", reply);
+        assert!(!reply.contains("GLM-5.1"), "got: {:?}", reply);
+        assert!(
+            !reply.contains("ready (restart to apply)"),
+            "got: {:?}",
+            reply
+        );
+    }
+
+    #[test]
+    fn test_extract_reply_allows_codex_status_footer() {
+        let req_id = "20260515-223836-3484bb45";
+        let output = "\
+• [CCB_START:reply-20260515-223836-
+  3484bb45]
+  我是 Codex，一个在你当前工作区内协作的 AI
+  编程助手。
+
+  我的主要定位是架构协作者、代码实现者和质量把关者。
+  [CCB_END:reply-20260515-223836-3484bb45]
+
+───────────────────────────────────────────
+
+
+› Explain this codebase
+
+  gpt-5.5 xhigh · D:\\GitHub\\warp-ccb";
+        let reply = extract_reply(req_id, output);
+        assert!(reply.contains("我是 Codex"), "got: {:?}", reply);
+        assert!(reply.contains("架构协作者"), "got: {:?}", reply);
+        assert!(!reply.contains("Explain this codebase"), "got: {:?}", reply);
+        assert!(!reply.contains("gpt-5.5 xhigh"), "got: {:?}", reply);
     }
 
     #[test]
@@ -2649,7 +2771,10 @@ yolo  agent (Kimi-k2.6 ●)  D:\\GitHub\\warp-ccb
 │   ▐█▛█▛█▌  Welcome to Kimi Code CLI!                     │
 │  Model: Kimi-k2.6                                        │
 ╰──────────────────────────────────────────────────────────╯";
-        assert_eq!(detect_bus_agent_from_terminal_output(output), Some(CLIAgent::Kimi));
+        assert_eq!(
+            detect_bus_agent_from_terminal_output(output),
+            Some(CLIAgent::Kimi)
+        );
     }
 
     #[test]

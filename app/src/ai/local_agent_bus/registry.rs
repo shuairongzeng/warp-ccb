@@ -95,6 +95,9 @@ impl RequestRegistry {
             .get(&terminal_view_id)
             .and_then(|req_id| self.entries.get(req_id))
             .map(|e| {
+                if e.req_id.starts_with("launch-") {
+                    return false;
+                }
                 !matches!(
                     e.status,
                     RequestStatus::Success
@@ -308,6 +311,22 @@ mod tests {
 
         // Trying to insert another request for the same terminal should be caught
         // by the caller checking has_active_for_terminal
+    }
+
+    #[test]
+    fn test_launch_placeholder_does_not_block_asks() {
+        let mut reg = RequestRegistry::new();
+        reg.insert(make_entry(
+            "launch-2557",
+            "codex",
+            EntityId::from_usize(2557),
+            RequestStatus::Injecting,
+        ));
+
+        assert!(
+            !reg.has_active_for_terminal(EntityId::from_usize(2557)),
+            "launch 占位不应让后续 ask 被 session_busy 拒绝"
+        );
     }
 
     #[test]
