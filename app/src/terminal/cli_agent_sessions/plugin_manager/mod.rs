@@ -266,6 +266,7 @@ pub(crate) fn plugin_manager_for_with_shell(
         | CLIAgent::Hermes
         | CLIAgent::Goose
         | CLIAgent::Vibe
+        | CLIAgent::Kimi
         | CLIAgent::Unknown => None,
     }
 }

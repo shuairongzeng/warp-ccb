@@ -38,6 +38,12 @@ pub enum BusCommand {
         req_id: String,
         #[serde(default = "default_caller")]
         caller: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        caller_terminal_view_id: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        caller_session_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        caller_cwd: Option<String>,
         #[serde(default)]
         queue: bool,
     },
@@ -288,6 +294,9 @@ mod tests {
                 cwd: Some("/tmp/project".to_string()),
                 req_id: "20260513-120000-000-1234-0".to_string(),
                 caller: "codex".to_string(),
+                caller_terminal_view_id: Some(2247),
+                caller_session_id: Some("caller-session".to_string()),
+                caller_cwd: Some("/tmp/caller".to_string()),
                 queue: false,
             },
         };
@@ -295,6 +304,40 @@ mod tests {
         assert!(json.contains("\"type\":\"ask\""));
         assert!(json.contains("\"provider\":\"claude\""));
         assert!(json.contains("\"prompt\":\"say hello\""));
+        assert!(json.contains("\"caller_terminal_view_id\":2247"));
+    }
+
+    #[test]
+    fn test_deserialize_ask_request_with_caller_identity() {
+        let json = r#"{
+            "v": 1,
+            "token": "tok",
+            "type": "ask",
+            "provider": "claude",
+            "prompt": "hello",
+            "req_id": "req-1",
+            "caller": "kimi",
+            "caller_terminal_view_id": 2247,
+            "caller_session_id": "kimi-session",
+            "caller_cwd": "D:\\GitHub\\warp-ccb"
+        }"#;
+
+        let req: BusRequest = serde_json::from_str(json).unwrap();
+        match req.command {
+            BusCommand::Ask {
+                caller,
+                caller_terminal_view_id,
+                caller_session_id,
+                caller_cwd,
+                ..
+            } => {
+                assert_eq!(caller, "kimi");
+                assert_eq!(caller_terminal_view_id, Some(2247));
+                assert_eq!(caller_session_id.as_deref(), Some("kimi-session"));
+                assert_eq!(caller_cwd.as_deref(), Some("D:\\GitHub\\warp-ccb"));
+            }
+            _ => panic!("expected Ask"),
+        }
     }
 
     #[test]

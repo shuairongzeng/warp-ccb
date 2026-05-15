@@ -128,6 +128,14 @@ const MISTRAL_ORANGE: ColorU = ColorU {
     a: 255,
 };
 
+/// Kimi brand color (Moonshot AI blue #4C6EF5)
+const KIMI_BLUE: ColorU = ColorU {
+    r: 76,
+    g: 110,
+    b: 245,
+    a: 255,
+};
+
 /// Represents a CLI agent (e.g., Claude Code, Gemini CLI, Codex, Amp, Droid, OpenCode, Copilot, Pi, Auggie, Cursor, Goose, Hermes, Mistral Vibe)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Sequence, Serialize, Deserialize)]
 pub enum CLIAgent {
@@ -144,6 +152,7 @@ pub enum CLIAgent {
     Goose,
     Hermes,
     Vibe,
+    Kimi,
     /// Represents an unknown/custom CLI agent matched by user-configured regex patterns.
     Unknown,
 }
@@ -165,6 +174,7 @@ impl CLIAgent {
             CLIAgent::Goose => "goose",
             CLIAgent::Hermes => "hermes",
             CLIAgent::Vibe => "vibe",
+            CLIAgent::Kimi => "kimi",
             CLIAgent::Unknown => "",
         }
     }
@@ -212,6 +222,7 @@ impl CLIAgent {
             CLIAgent::Goose => "Goose",
             CLIAgent::Hermes => "Hermes",
             CLIAgent::Vibe => "Mistral Vibe",
+            CLIAgent::Kimi => "Kimi",
             CLIAgent::Unknown => "CLI Agent",
         }
     }
@@ -235,6 +246,7 @@ impl CLIAgent {
             // still drives the toolbar tile; an `Icon::MistralLogo` can be wired
             // up in a follow-up once an officially licensed SVG is available.
             CLIAgent::Vibe => None,
+            CLIAgent::Kimi => None,
             CLIAgent::Unknown => None,
         }
     }
@@ -265,6 +277,7 @@ impl CLIAgent {
             CLIAgent::Goose => &[SkillProvider::Agents],
             CLIAgent::Hermes => &[SkillProvider::Agents],
             CLIAgent::Vibe => &[SkillProvider::Agents],
+            CLIAgent::Kimi => &[SkillProvider::Agents],
             CLIAgent::Unknown => &[],
         }
     }
@@ -307,6 +320,7 @@ impl CLIAgent {
             CLIAgent::Goose => Some(GOOSE_COLOR),
             CLIAgent::Hermes => Some(HERMES_PURPLE),
             CLIAgent::Vibe => Some(MISTRAL_ORANGE),
+            CLIAgent::Kimi => Some(KIMI_BLUE),
             CLIAgent::Unknown => None,
         }
     }
@@ -572,6 +586,7 @@ impl From<CLIAgent> for CLIAgentType {
             CLIAgent::Goose => CLIAgentType::Goose,
             CLIAgent::Hermes => CLIAgentType::Hermes,
             CLIAgent::Vibe => CLIAgentType::Vibe,
+            CLIAgent::Kimi => CLIAgentType::Kimi,
             CLIAgent::Unknown => CLIAgentType::Unknown,
         }
     }

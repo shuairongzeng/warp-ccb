@@ -20,6 +20,10 @@ pub struct RequestEntry {
     pub updated_at_ms: u64,
     pub error_message: Option<String>,
     pub reply_content: Option<String>,
+    pub callback_provider: Option<String>,
+    pub caller_terminal_view_id: Option<EntityId>,
+    pub caller_session_id: Option<String>,
+    pub caller_cwd: Option<String>,
 }
 
 /// Thread-safe (single-threaded access on Warp main thread) request registry.
@@ -211,6 +215,10 @@ mod tests {
             updated_at_ms: 1000,
             error_message: None,
             reply_content: None,
+            callback_provider: None,
+            caller_terminal_view_id: Some(EntityId::from_usize(2247)),
+            caller_session_id: Some("caller-session".to_string()),
+            caller_cwd: Some("D:\\GitHub\\warp-ccb".to_string()),
         }
     }
 
@@ -311,6 +319,18 @@ mod tests {
             EntityId::from_usize(1),
             RequestStatus::Success,
         ));
+        assert_eq!(
+            reg.get("r1").unwrap().caller_terminal_view_id,
+            Some(EntityId::from_usize(2247))
+        );
+        assert_eq!(
+            reg.get("r1").unwrap().caller_session_id.as_deref(),
+            Some("caller-session")
+        );
+        assert_eq!(
+            reg.get("r1").unwrap().caller_cwd.as_deref(),
+            Some("D:\\GitHub\\warp-ccb")
+        );
         reg.set_reply_content("r1", "Hello world".to_string());
         assert_eq!(
             reg.get("r1").unwrap().reply_content,

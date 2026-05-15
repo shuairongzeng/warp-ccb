@@ -10681,8 +10681,8 @@ impl TerminalView {
                         let view_id = self.view_id;
                         crate::ai::local_agent_bus::LocalAgentBusModel::handle(ctx).update(
                             ctx,
-                            |bus, _ctx| {
-                                bus.check_block_output_for_done(view_id, output);
+                            |bus, ctx| {
+                                bus.check_block_output_for_done(view_id, output, ctx);
                             },
                         );
                     }
