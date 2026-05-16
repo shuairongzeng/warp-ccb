@@ -9,6 +9,7 @@
 
 pub mod completion;
 pub mod protocol;
+mod raw_output;
 pub mod registry;
 pub mod server;
 pub mod store;
@@ -20,6 +21,7 @@ use protocol::{
     BusAddressInfo, BusCommand, BusResponse, BusResponseData, ChainProgress, ChainStepResult,
     RequestStatus, SessionInfo, PROTOCOL_VERSION,
 };
+use raw_output::RawOutputCapture;
 use registry::RequestRegistry;
 use server::LocalAgentBusServer;
 use store::ResponseStore;
@@ -62,6 +64,7 @@ pub struct LocalAgentBusModel {
     registry: RequestRegistry,
     store: ResponseStore,
     completion: CompletionTracker,
+    raw_output_capture: RawOutputCapture,
     terminal_handles: HashMap<EntityId, WeakViewHandle<TerminalView>>,
     /// Agent panes launched by LocalAgentBus, including agents without Warp session listeners.
     bus_launched_sessions: HashMap<EntityId, CLIAgent>,
@@ -160,6 +163,7 @@ impl LocalAgentBusModel {
             registry: RequestRegistry::new(),
             store: ResponseStore::new(response_dir),
             completion: CompletionTracker::new(),
+            raw_output_capture: RawOutputCapture::new(),
             terminal_handles: HashMap::new(),
             bus_launched_sessions: HashMap::new(),
             request_queue: Vec::new(),
@@ -183,12 +187,19 @@ impl LocalAgentBusModel {
             view_id
         );
         self.terminal_handles.insert(view_id, handle);
+        self.raw_output_capture.register_pane(view_id);
     }
 
     /// Remove a terminal handle when the session ends.
     pub fn deregister_terminal_handle(&mut self, view_id: EntityId) {
         self.terminal_handles.remove(&view_id);
         self.bus_launched_sessions.remove(&view_id);
+        self.raw_output_capture.deregister_pane(view_id);
+    }
+
+    /// Append raw PTY bytes for a terminal pane.
+    pub fn append_raw_output(&mut self, view_id: EntityId, bytes: &[u8]) {
+        self.raw_output_capture.append(view_id, bytes);
     }
 
     /// Register the PaneGroup handle for creating new terminal panes.
@@ -205,51 +216,50 @@ impl LocalAgentBusModel {
         ctx: &mut ModelContext<Self>,
     ) {
         for req_id in self.completion.pending_for_terminal(view_id) {
-            if self.completion.check_done_marker(&req_id, output) {
-                if !self.completion.is_output_length_stable(
-                    &req_id,
-                    output,
-                    std::time::Duration::from_millis(CCB_OUTPUT_SETTLE_DELAY_MS),
-                ) {
-                    log::info!(
-                        "CCB诊断: block_completed 检测到完成标记但输出长度尚未稳定，延迟确认 req_id={} output_len={}",
-                        req_id,
-                        output.len()
-                    );
-                    continue;
-                }
+            let raw_output = self.raw_output_capture.snapshot(&req_id);
+            let selected = select_reply_capture(
+                &req_id,
+                raw_output.as_deref(),
+                Some(output),
+                CaptureSource::BlockCompleted,
+            );
+            let Some(selected) = selected else {
+                continue;
+            };
 
-                log::info!("LocalAgentBus: CCB_DONE detected for req {}", req_id);
-                let reply = extract_reply(&req_id, output);
-                let will_finalize = !reply.trim().is_empty();
-                log_reply_capture_attempt(
-                    &req_id,
-                    CaptureSource::BlockCompleted,
-                    view_id,
-                    output,
-                    reply.len(),
-                    will_finalize,
-                );
-                if !will_finalize {
-                    write_reply_capture_debug_file(
-                        &req_id,
-                        CaptureSource::BlockCompleted,
-                        output,
-                        &reply,
-                    );
-                    log::info!(
-                        "CCB诊断: block_completed 检测到完成标记但回复为空，保持 Running req_id={}",
-                        req_id
-                    );
-                    continue;
-                }
-                self.finalize_request_with_reply(
-                    &req_id,
-                    reply,
-                    CaptureSource::BlockCompleted,
-                    ctx,
-                );
+            if !self.is_capture_output_stable(
+                &req_id,
+                selected.source,
+                selected.output,
+                "block_completed",
+            ) {
+                continue;
             }
+
+            log::info!("LocalAgentBus: CCB_DONE detected for req {}", req_id);
+            let will_finalize = !selected.reply.trim().is_empty();
+            log_reply_capture_attempt(
+                &req_id,
+                selected.source,
+                view_id,
+                selected.output,
+                selected.reply.len(),
+                will_finalize,
+            );
+            if !will_finalize {
+                write_reply_capture_debug_file(
+                    &req_id,
+                    selected.source,
+                    selected.output,
+                    &selected.reply,
+                );
+                log::info!(
+                    "CCB诊断: block_completed 检测到完成标记但回复为空，保持 Running req_id={}",
+                    req_id
+                );
+                continue;
+            }
+            self.finalize_request_with_reply(&req_id, selected.reply, selected.source, ctx);
         }
     }
 
@@ -332,110 +342,75 @@ impl LocalAgentBusModel {
                 Some(block.output_grid().contents_to_string(false, None))
             });
 
-            if let Some(output) = output {
-                // Unconditional debug: log output length for each scan tick
+            if let Some(grid_output) = output {
                 for req_id in &req_ids {
-                    let marker_ids = completion::reply_marker_ids(req_id);
-                    let has_start = marker_ids.iter().any(|marker_id| {
-                        !completion::find_unwrapped_ccb_tag_ranges(&output, "CCB_START", marker_id)
-                            .is_empty()
-                    });
-                    let has_end = marker_ids.iter().any(|marker_id| {
-                        !completion::find_unwrapped_ccb_tag_ranges(&output, "CCB_END", marker_id)
-                            .is_empty()
-                    });
-                    let has_reply_closure = marker_ids.iter().any(|marker_id| {
-                        completion::find_last_complete_reply_span(&output, marker_id).is_some()
-                    });
-                    log::info!(
-                        "CCB_SCAN_TICK: req={}, output_len={}, has_start={}, has_end={}, has_reply_closure={}",
+                    let raw_output = self.raw_output_capture.snapshot(req_id);
+                    log_scan_tick_diagnostics(req_id, raw_output.as_deref(), Some(&grid_output));
+                }
+
+                for req_id in &req_ids {
+                    let raw_output = self.raw_output_capture.snapshot(req_id);
+                    let selected = select_reply_capture_for_scan(
                         req_id,
-                        output.len(),
-                        has_start,
-                        has_end,
-                        has_reply_closure,
+                        raw_output.as_deref(),
+                        Some(&grid_output),
                     );
-                    // Write unconditional debug file (overwritten each tick)
-                    let tick_debug = std::env::temp_dir().join(format!("ccb_tick_{}.txt", req_id));
-                    let debug_output = if has_start || has_end {
-                        output.clone()
-                    } else {
-                        debug_prefix(&output, 3000)
+                    let Some(selected) = selected else {
+                        continue;
                     };
+
+                    if !self.is_capture_output_stable(
+                        req_id,
+                        selected.source,
+                        selected.output,
+                        "output_scan",
+                    ) {
+                        continue;
+                    }
+
+                    log::info!(
+                        "LocalAgentBus: CCB_DONE detected via output scan for req {} source={:?}",
+                        req_id,
+                        selected.source
+                    );
+                    let will_finalize = !selected.reply.trim().is_empty();
+                    log_reply_capture_attempt(
+                        req_id,
+                        selected.source,
+                        view_id,
+                        selected.output,
+                        selected.reply.len(),
+                        will_finalize,
+                    );
+                    log::info!(
+                        "LocalAgentBus: captured reply ({} chars) for req {}",
+                        selected.reply.len(),
+                        req_id
+                    );
+                    let debug_path = std::env::temp_dir().join(format!("ccb_scan_{}.txt", req_id));
                     let _ = std::fs::write(
-                        &tick_debug,
+                        &debug_path,
                         format!(
-                            "LEN={}\nHAS_START={}\nHAS_END={}\nHAS_REPLY_CLOSURE={}\n---\n{}\n---",
-                            output.len(),
-                            has_start,
-                            has_end,
-                            has_reply_closure,
-                            debug_output
+                            "SOURCE={:?}\nREPLY_LEN={}\n---OUTPUT---\n{}\n---END---",
+                            selected.source,
+                            selected.reply.len(),
+                            selected.output
                         ),
                     );
-                }
-                for req_id in &req_ids {
-                    if self.completion.check_done_marker(req_id, &output) {
-                        if !self.completion.is_output_length_stable(
+                    if !will_finalize {
+                        write_reply_capture_debug_file(
                             req_id,
-                            &output,
-                            std::time::Duration::from_millis(CCB_OUTPUT_SETTLE_DELAY_MS),
-                        ) {
-                            log::info!(
-                                "CCB诊断: 检测到完成标记但输出长度尚未稳定，延迟确认 req_id={} output_len={}",
-                                req_id,
-                                output.len()
-                            );
-                            continue;
-                        }
-                        log::info!(
-                            "LocalAgentBus: CCB_DONE detected via output scan for req {}",
-                            req_id
-                        );
-                        let reply = extract_reply(req_id, &output);
-                        let will_finalize = !reply.trim().is_empty();
-                        log_reply_capture_attempt(
-                            req_id,
-                            CaptureSource::OutputScan,
-                            view_id,
-                            &output,
-                            reply.len(),
-                            will_finalize,
+                            selected.source,
+                            selected.output,
+                            &selected.reply,
                         );
                         log::info!(
-                            "LocalAgentBus: captured reply ({} chars) for req {}",
-                            reply.len(),
+                            "LocalAgentBus: scan found done marker but empty reply for req {}, skipping",
                             req_id
                         );
-                        // Debug: write scan output
-                        let debug_path =
-                            std::env::temp_dir().join(format!("ccb_scan_{}.txt", req_id));
-                        let _ = std::fs::write(
-                            &debug_path,
-                            format!(
-                                "REPLY_LEN={}\n---OUTPUT---\n{}\n---END---",
-                                reply.len(),
-                                output
-                            ),
-                        );
-                        // Don't finalize if reply is empty — let next tick retry
-                        if !will_finalize {
-                            write_reply_capture_debug_file(
-                                req_id,
-                                CaptureSource::OutputScan,
-                                &output,
-                                &reply,
-                            );
-                            log::info!("LocalAgentBus: scan found done marker but empty reply for req {}, skipping", req_id);
-                            continue;
-                        }
-                        self.finalize_request_with_reply(
-                            req_id,
-                            reply,
-                            CaptureSource::OutputScan,
-                            ctx,
-                        );
+                        continue;
                     }
+                    self.finalize_request_with_reply(req_id, selected.reply, selected.source, ctx);
                 }
             }
         }
@@ -501,7 +476,8 @@ impl LocalAgentBusModel {
 
         for req_id in completed {
             let mut reply_text = String::new();
-            if let Some(reply) = self.capture_reply_for_request(&req_id, ctx) {
+            let mut capture_source = CaptureSource::SessionCompletion;
+            if let Some((reply, source)) = self.capture_reply_for_request(&req_id, ctx) {
                 if !reply.is_empty() {
                     log::info!(
                         "LocalAgentBus: captured reply ({} chars) via session completion for req {}",
@@ -510,6 +486,7 @@ impl LocalAgentBusModel {
                     );
                     self.registry.set_reply_content(&req_id, reply.clone());
                     reply_text = reply;
+                    capture_source = source;
                 }
             }
             // If reply is still empty, terminal output may not be fully rendered yet.
@@ -521,16 +498,12 @@ impl LocalAgentBusModel {
                 );
                 continue;
             }
-            self.finalize_request_with_reply(
-                &req_id,
-                reply_text,
-                CaptureSource::SessionCompletion,
-                ctx,
-            );
+            self.finalize_request_with_reply(&req_id, reply_text, capture_source, ctx);
         }
         for req_id in errored {
             self.registry.update_status(&req_id, RequestStatus::Error);
             self.completion.deregister(&req_id);
+            self.raw_output_capture.deregister_request(&req_id);
             self.notify_waiters(&req_id);
         }
 
@@ -549,7 +522,7 @@ impl LocalAgentBusModel {
         &mut self,
         req_id: &str,
         ctx: &mut ModelContext<Self>,
-    ) -> Option<String> {
+    ) -> Option<(String, CaptureSource)> {
         log::info!("CCB_DEBUG capture_reply_for_request: req_id={}", req_id);
         let view_id = match self.registry.get(req_id) {
             Some(e) => e.terminal_view_id,
@@ -579,38 +552,81 @@ impl LocalAgentBusModel {
             Some(output)
         });
 
-        let Some(output) = output else {
+        let Some(grid_output) = output else {
             return None;
         };
 
+        let raw_output = self.raw_output_capture.snapshot(req_id);
+        log_scan_tick_diagnostics(req_id, raw_output.as_deref(), Some(&grid_output));
+
         // Debug: write terminal output to file for diagnosis
         let debug_path = std::env::temp_dir().join(format!("ccb_capture_{}.txt", req_id));
-        let _ = std::fs::write(&debug_path, &output);
+        let _ = std::fs::write(
+            &debug_path,
+            format!(
+                "---RAW---\n{}\n---GRID---\n{}",
+                raw_output.as_deref().unwrap_or(""),
+                grid_output
+            ),
+        );
         log::info!(
-            "CCB_DEBUG: wrote {} chars to {:?}",
-            output.len(),
+            "CCB_DEBUG: wrote raw_len={} grid_len={} chars to {:?}",
+            raw_output.as_deref().map(str::len).unwrap_or(0),
+            grid_output.len(),
             debug_path
         );
 
-        if !self.completion.is_output_length_stable(
+        let selected = select_reply_capture(
             req_id,
-            &output,
-            std::time::Duration::from_millis(CCB_OUTPUT_SETTLE_DELAY_MS),
+            raw_output.as_deref(),
+            Some(&grid_output),
+            CaptureSource::SessionCompletion,
+        )?;
+
+        if !self.is_capture_output_stable(
+            req_id,
+            selected.source,
+            selected.output,
+            "session_completion",
         ) {
-            log::info!(
-                "CCB诊断: session_completion 检测到完成状态但输出长度尚未稳定，延迟捕获 req_id={} output_len={}",
-                req_id,
-                output.len()
-            );
             return None;
         }
 
-        let reply = extract_reply(req_id, &output);
-        if !reply.is_empty() {
-            return Some(reply);
+        if !selected.reply.is_empty() {
+            return Some((selected.reply, selected.source));
         }
 
         None
+    }
+
+    fn is_capture_output_stable(
+        &mut self,
+        req_id: &str,
+        source: CaptureSource,
+        output: &str,
+        stage: &str,
+    ) -> bool {
+        let stable_for = std::time::Duration::from_millis(CCB_OUTPUT_SETTLE_DELAY_MS);
+        let stable = match source {
+            CaptureSource::RawOutputScan => self
+                .raw_output_capture
+                .is_request_stable(req_id, stable_for),
+            _ => self
+                .completion
+                .is_output_length_stable(req_id, output, stable_for),
+        };
+
+        if !stable {
+            log::info!(
+                "CCB诊断: {} 检测到完成标记但输出长度尚未稳定，延迟确认 req_id={} source={:?} output_len={}",
+                stage,
+                req_id,
+                source,
+                output.len()
+            );
+        }
+
+        stable
     }
 
     fn finalize_request_with_reply(
@@ -658,6 +674,7 @@ impl LocalAgentBusModel {
         self.registry.update_status(req_id, RequestStatus::Success);
         self.persist_response(req_id);
         self.completion.deregister(req_id);
+        self.raw_output_capture.deregister_request(req_id);
         self.notify_waiters(req_id);
         self.deliver_callback(req_id, &from_provider, &reply, ctx);
         true
@@ -888,6 +905,8 @@ impl LocalAgentBusModel {
             "[CCB_REQ_ID:{}]\n{}\nReply using exactly this format. Put the markers on their own lines and do not wrap them in backticks:\n[CCB_START:{}]\n<your reply>\n[CCB_END:{}]",
             req_id, prompt, reply_marker_id, reply_marker_id
         );
+        self.raw_output_capture
+            .register_request(req_id.clone(), entity_id);
         let injected = self.inject_prompt(entity_id, &wrapped_prompt, ctx);
 
         if injected {
@@ -896,6 +915,7 @@ impl LocalAgentBusModel {
                 .register(req_id.clone(), provider.clone(), entity_id);
         } else {
             self.registry.update_status(&req_id, RequestStatus::Error);
+            self.raw_output_capture.deregister_request(&req_id);
             return BusResponse::error("failed to inject prompt into terminal");
         }
 
@@ -918,6 +938,8 @@ impl LocalAgentBusModel {
         for (timed_out_req_id, _provider) in timeouts {
             self.registry
                 .update_status(&timed_out_req_id, RequestStatus::Timeout);
+            self.raw_output_capture
+                .deregister_request(&timed_out_req_id);
         }
 
         let mut replies = self.registry.query_replies(provider, req_id, count);
@@ -1034,6 +1056,7 @@ impl LocalAgentBusModel {
             .update_status(req_id, RequestStatus::Cancelled)
         {
             self.completion.deregister(req_id);
+            self.raw_output_capture.deregister_request(req_id);
 
             // Send Ctrl-C to the terminal to interrupt the agent.
             self.send_ctrl_c(req_id, ctx);
@@ -1373,6 +1396,8 @@ impl LocalAgentBusModel {
                 "[CCB_REQ_ID:{}]\n{}\nReply using exactly this format. Put the markers on their own lines and do not wrap them in backticks:\n[CCB_START:{}]\n<your reply>\n[CCB_END:{}]",
                 queued.req_id, queued.prompt, reply_marker_id, reply_marker_id
             );
+            self.raw_output_capture
+                .register_request(queued.req_id.clone(), queued.terminal_view_id);
             let injected = self.inject_prompt(queued.terminal_view_id, &wrapped_prompt, ctx);
 
             if injected {
@@ -1386,6 +1411,7 @@ impl LocalAgentBusModel {
             } else {
                 self.registry
                     .update_status(&queued.req_id, RequestStatus::Error);
+                self.raw_output_capture.deregister_request(&queued.req_id);
             }
         }
     }
@@ -1674,6 +1700,8 @@ impl LocalAgentBusModel {
             "[CCB_REQ_ID:{}]\n{}\nReply using exactly this format. Put the markers on their own lines and do not wrap them in backticks:\n[CCB_START:{}]\n<your reply>\n[CCB_END:{}]",
             req_id, prompt, reply_marker_id, reply_marker_id
         );
+        self.raw_output_capture
+            .register_request(req_id.clone(), entity_id);
         let injected = self.inject_prompt(entity_id, &wrapped_prompt, ctx);
 
         if injected {
@@ -1682,6 +1710,7 @@ impl LocalAgentBusModel {
                 .register(req_id.clone(), provider.clone(), entity_id);
         } else {
             self.registry.update_status(&req_id, RequestStatus::Error);
+            self.raw_output_capture.deregister_request(&req_id);
         }
     }
 
@@ -2227,6 +2256,7 @@ struct ChainState {
 #[derive(Debug, Clone, Copy)]
 enum CaptureSource {
     BlockCompleted,
+    RawOutputScan,
     OutputScan,
     SessionCompletion,
 }
@@ -2333,6 +2363,7 @@ fn write_reply_capture_debug_file(req_id: &str, source: CaptureSource, output: &
 fn capture_source_name(source: CaptureSource) -> &'static str {
     match source {
         CaptureSource::BlockCompleted => "block_completed",
+        CaptureSource::RawOutputScan => "raw_output_scan",
         CaptureSource::OutputScan => "output_scan",
         CaptureSource::SessionCompletion => "session_completion",
     }
@@ -2340,6 +2371,138 @@ fn capture_source_name(source: CaptureSource) -> &'static str {
 
 fn debug_prefix(input: &str, max_chars: usize) -> String {
     input.chars().take(max_chars).collect()
+}
+
+#[derive(Debug)]
+struct SelectedReplyCapture<'a> {
+    source: CaptureSource,
+    output: &'a str,
+    reply: String,
+}
+
+#[derive(Debug)]
+struct MarkerDiagnostics {
+    len: usize,
+    has_start: bool,
+    has_end: bool,
+    has_reply_closure: bool,
+}
+
+fn select_reply_capture_for_scan<'a>(
+    req_id: &str,
+    raw_output: Option<&'a str>,
+    grid_output: Option<&'a str>,
+) -> Option<SelectedReplyCapture<'a>> {
+    select_reply_capture(req_id, raw_output, grid_output, CaptureSource::OutputScan)
+}
+
+fn select_reply_capture<'a>(
+    req_id: &str,
+    raw_output: Option<&'a str>,
+    grid_output: Option<&'a str>,
+    grid_source: CaptureSource,
+) -> Option<SelectedReplyCapture<'a>> {
+    if let Some(raw_output) = raw_output.filter(|output| !output.is_empty()) {
+        let reply = extract_reply(req_id, raw_output);
+        if !reply.trim().is_empty() {
+            return Some(SelectedReplyCapture {
+                source: CaptureSource::RawOutputScan,
+                output: raw_output,
+                reply,
+            });
+        }
+
+        let raw_diag = collect_marker_diagnostics(req_id, Some(raw_output));
+        if raw_diag.has_start && !raw_diag.has_end {
+            return None;
+        }
+    }
+
+    let grid_output = grid_output?;
+    let reply = extract_reply(req_id, grid_output);
+    if reply.trim().is_empty() {
+        return None;
+    }
+
+    Some(SelectedReplyCapture {
+        source: grid_source,
+        output: grid_output,
+        reply,
+    })
+}
+
+fn collect_marker_diagnostics(req_id: &str, output: Option<&str>) -> MarkerDiagnostics {
+    let Some(output) = output else {
+        return MarkerDiagnostics {
+            len: 0,
+            has_start: false,
+            has_end: false,
+            has_reply_closure: false,
+        };
+    };
+
+    let marker_ids = completion::reply_marker_ids(req_id);
+    MarkerDiagnostics {
+        len: output.len(),
+        has_start: marker_ids.iter().any(|marker_id| {
+            !completion::find_unwrapped_ccb_tag_ranges(output, "CCB_START", marker_id).is_empty()
+        }),
+        has_end: marker_ids.iter().any(|marker_id| {
+            !completion::find_unwrapped_ccb_tag_ranges(output, "CCB_END", marker_id).is_empty()
+        }),
+        has_reply_closure: marker_ids.iter().any(|marker_id| {
+            completion::find_last_complete_reply_span(output, marker_id).is_some()
+        }),
+    }
+}
+
+fn log_scan_tick_diagnostics(req_id: &str, raw_output: Option<&str>, grid_output: Option<&str>) {
+    let raw_diag = collect_marker_diagnostics(req_id, raw_output);
+    let grid_diag = collect_marker_diagnostics(req_id, grid_output);
+
+    log::info!(
+        "CCB_SCAN_TICK: req={} RAW_LEN={} GRID_LEN={} RAW_HAS_REPLY_CLOSURE={} GRID_HAS_REPLY_CLOSURE={} RAW_HAS_START={} RAW_HAS_END={} GRID_HAS_START={} GRID_HAS_END={}",
+        req_id,
+        raw_diag.len,
+        grid_diag.len,
+        raw_diag.has_reply_closure,
+        grid_diag.has_reply_closure,
+        raw_diag.has_start,
+        raw_diag.has_end,
+        grid_diag.has_start,
+        grid_diag.has_end,
+    );
+
+    let tick_debug = std::env::temp_dir().join(format!("ccb_tick_{}.txt", req_id));
+    let raw_debug = debug_output_for_tick(raw_output, &raw_diag);
+    let grid_debug = debug_output_for_tick(grid_output, &grid_diag);
+    let _ = std::fs::write(
+        &tick_debug,
+        format!(
+            "RAW_LEN={}\nGRID_LEN={}\nRAW_HAS_REPLY_CLOSURE={}\nGRID_HAS_REPLY_CLOSURE={}\nRAW_HAS_START={}\nRAW_HAS_END={}\nGRID_HAS_START={}\nGRID_HAS_END={}\n---RAW---\n{}\n---GRID---\n{}\n---",
+            raw_diag.len,
+            grid_diag.len,
+            raw_diag.has_reply_closure,
+            grid_diag.has_reply_closure,
+            raw_diag.has_start,
+            raw_diag.has_end,
+            grid_diag.has_start,
+            grid_diag.has_end,
+            raw_debug,
+            grid_debug,
+        ),
+    );
+}
+
+fn debug_output_for_tick(output: Option<&str>, diag: &MarkerDiagnostics) -> String {
+    let Some(output) = output else {
+        return String::new();
+    };
+    if diag.has_start || diag.has_end {
+        output.to_string()
+    } else {
+        debug_prefix(output, 3000)
+    }
 }
 
 /// Extract reply content from terminal output.
@@ -2619,6 +2782,85 @@ mod tests {
         let truncated = debug_prefix(&output, 3000);
         assert!(truncated.is_char_boundary(truncated.len()));
         assert!(output.starts_with(&truncated));
+    }
+
+    #[test]
+    fn test_select_reply_capture_prefers_raw_when_grid_is_damaged() {
+        let req_id = "raw-r1";
+        let raw = "\
+[CCB_START:reply-raw-r1]
+raw reply
+[CCB_END:reply-raw-r1]
+";
+        let grid = "\
+[CCB_START:reply-raw-r1]
+grid reply
+CCB_END:reply-raw-r1]
+";
+
+        let selected =
+            select_reply_capture_for_scan(req_id, Some(raw), Some(grid)).expect("raw should win");
+
+        assert!(matches!(selected.source, CaptureSource::RawOutputScan));
+        assert_eq!(selected.reply, "raw reply");
+    }
+
+    #[test]
+    fn test_select_reply_capture_does_not_fallback_to_grid_when_raw_is_available() {
+        let req_id = "raw-r2";
+        let raw = "[CCB_START:reply-raw-r2]\npartial reply\n";
+        let grid = "\
+[CCB_START:reply-raw-r2]
+grid reply
+[CCB_END:reply-raw-r2]
+";
+
+        assert!(
+            select_reply_capture_for_scan(req_id, Some(raw), Some(grid)).is_none(),
+            "raw 可用时，grid 只能作为诊断，不能提前完成请求"
+        );
+    }
+
+    #[test]
+    fn test_select_reply_capture_falls_back_to_grid_when_raw_has_no_valid_closure() {
+        let req_id = "grid-fallback-r1";
+        let raw = "\
+[CCB_REQ_ID:grid-fallback-r1]
+Reply using exactly this format:
+[CCB_START:reply-grid-fallback-r1]
+<your reply>
+[CCB_END:reply-grid-fallback-r1]
+\x08• [CCB_START:reply-grid-fallback-r1
+  ] hello from agent [CCB_END:reply-
+  grid-fallback-r1]
+";
+        let grid = "\
+[CCB_START:reply-grid-fallback-r1]
+hello from agent
+[CCB_END:reply-grid-fallback-r1]
+";
+
+        let selected = select_reply_capture_for_scan(req_id, Some(raw), Some(grid))
+            .expect("grid should be allowed when raw cannot form a valid closure");
+
+        assert!(matches!(selected.source, CaptureSource::OutputScan));
+        assert_eq!(selected.reply, "hello from agent");
+    }
+
+    #[test]
+    fn test_select_reply_capture_uses_grid_when_raw_is_unavailable() {
+        let req_id = "grid-r1";
+        let grid = "\
+[CCB_START:reply-grid-r1]
+grid reply
+[CCB_END:reply-grid-r1]
+";
+
+        let selected =
+            select_reply_capture_for_scan(req_id, None, Some(grid)).expect("grid fallback works");
+
+        assert!(matches!(selected.source, CaptureSource::OutputScan));
+        assert_eq!(selected.reply, "grid reply");
     }
 
     #[test]

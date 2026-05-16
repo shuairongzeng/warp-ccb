@@ -3024,6 +3024,7 @@ impl TerminalView {
         ctx: &mut ViewContext<Self>,
     ) -> Self {
         let terminal_view_id = ctx.view_id();
+        let local_agent_bus_raw_reads_rx = inactive_pty_reads_rx.clone();
         let active_session = ctx.add_model(|ctx| {
             ActiveSession::new(sessions.clone(), model_events_handle.clone(), ctx)
         });
@@ -4272,6 +4273,22 @@ impl TerminalView {
             crate::ai::local_agent_bus::LocalAgentBusModel::handle(ctx).update(ctx, |bus, _ctx| {
                 bus.register_terminal_handle(view_id, weak_handle);
             });
+        }
+
+        if let Some(raw_reads_rx) = local_agent_bus_raw_reads_rx {
+            let view_id = terminal_view.view_id;
+            let _ = ctx.spawn_stream_local(
+                raw_reads_rx.activate_cloned(),
+                move |_view, bytes, ctx| {
+                    crate::ai::local_agent_bus::LocalAgentBusModel::handle(ctx).update(
+                        ctx,
+                        |bus, _ctx| {
+                            bus.append_raw_output(view_id, bytes.as_slice());
+                        },
+                    );
+                },
+                |_, _| {},
+            );
         }
 
         // Forward RemoteServerManager setup events into the terminal event stream

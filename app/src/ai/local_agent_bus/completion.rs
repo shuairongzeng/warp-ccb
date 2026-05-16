@@ -177,16 +177,16 @@ pub(crate) fn find_unwrapped_ccb_tag_ranges(
         let mut search_from = 0;
 
         while search_from < output.len() {
-            let Some(offset) = output[search_from..].find(&prefix) else {
+            let Some(offset) = output[search_from..].find(&prefix.text) else {
                 break;
             };
-            let start = search_from + offset;
-            if !is_valid_ccb_tag_prefix_occurrence(output, start, &prefix, tag_name) {
-                search_from = start + prefix.len();
+            let prefix_start = search_from + offset;
+            let Some(start) = resolve_ccb_tag_start(output, prefix_start, &prefix, tag_name) else {
+                search_from = prefix_start + prefix.text.len();
                 continue;
-            }
+            };
 
-            let mut idx = start + prefix.len();
+            let mut idx = prefix_start + prefix.text.len();
             let mut matched = true;
 
             for expected in req_id.chars() {
@@ -216,11 +216,11 @@ pub(crate) fn find_unwrapped_ccb_tag_ranges(
                         search_from = next_idx;
                     }
                     _ => {
-                        search_from = start + prefix.len();
+                        search_from = prefix_start + prefix.text.len();
                     }
                 }
             } else {
-                search_from = start + prefix.len();
+                search_from = prefix_start + prefix.text.len();
             }
         }
     }
@@ -230,15 +230,73 @@ pub(crate) fn find_unwrapped_ccb_tag_ranges(
     ranges
 }
 
-fn ccb_tag_prefixes(tag_name: &str) -> Vec<String> {
+struct CcbTagPrefix {
+    text: String,
+    split_after_ccb: bool,
+}
+
+fn ccb_tag_prefixes(tag_name: &str) -> Vec<CcbTagPrefix> {
     if tag_name == "CCB_END" {
         vec![
-            "[CCB_END:".to_string(),
-            "CCB_END:".to_string(),
-            "B_END:".to_string(),
+            CcbTagPrefix::new("[CCB_END:", false),
+            CcbTagPrefix::new("CCB_END:", false),
+            CcbTagPrefix::new("B_END:", false),
+            CcbTagPrefix::new("END:", true),
+        ]
+    } else if tag_name == "CCB_START" {
+        vec![
+            CcbTagPrefix::new("[CCB_START:", false),
+            CcbTagPrefix::new("START:", true),
         ]
     } else {
-        vec![format!("[{}:", tag_name)]
+        vec![CcbTagPrefix::new(format!("[{}:", tag_name), false)]
+    }
+}
+
+impl CcbTagPrefix {
+    fn new(text: impl Into<String>, split_after_ccb: bool) -> Self {
+        Self {
+            text: text.into(),
+            split_after_ccb,
+        }
+    }
+}
+
+fn resolve_ccb_tag_start(
+    output: &str,
+    prefix_start: usize,
+    prefix: &CcbTagPrefix,
+    tag_name: &str,
+) -> Option<usize> {
+    if prefix.split_after_ccb {
+        return split_ccb_prefix_start(output, prefix_start);
+    }
+
+    if is_valid_ccb_tag_prefix_occurrence(output, prefix_start, &prefix.text, tag_name) {
+        Some(prefix_start)
+    } else {
+        None
+    }
+}
+
+fn split_ccb_prefix_start(output: &str, prefix_start: usize) -> Option<usize> {
+    let mut end = prefix_start;
+    while end > 0 {
+        let (prev, ch) = prev_char_before(output, end)?;
+        if ch.is_whitespace() {
+            end = prev;
+        } else {
+            break;
+        }
+    }
+
+    let before = output.get(..end)?;
+    if before.ends_with("[CCB_") {
+        Some(end - "[CCB_".len())
+    } else if before.ends_with("CCB_") {
+        Some(end - "CCB_".len())
+    } else {
+        None
     }
 }
 
@@ -428,6 +486,10 @@ fn next_char_at(input: &str, index: usize) -> Option<(char, usize)> {
     Some((ch, index + ch.len_utf8()))
 }
 
+fn prev_char_before(input: &str, index: usize) -> Option<(usize, char)> {
+    input.get(..index)?.char_indices().next_back()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -614,6 +676,25 @@ yolo  agent (Kimi-k2.6 ●)  D:\\GitHub\\warp-ccb";
         assert!(
             tracker.check_done_marker(req_id, output),
             "Warp 输出网格可能在行尾裁掉 END marker 的 `[CC` 前缀，仍应识别真实回复闭环"
+        );
+    }
+
+    #[test]
+    fn test_done_marker_allows_split_ccb_end_tag_name() {
+        let tracker = CompletionTracker::new();
+        let req_id = "20260516-144955-8cc19f1e";
+        let output = "\
+• [CCB_START:reply-20260516-
+  144955-8cc19f1e] 重读《背影》，依然湿了眼眶。
+  有些爱，经不起等待；有些人，需要好好珍惜。 [CCB_
+  END:reply-20260516-144955-
+  8cc19f1e]
+
+── input ──────────────────";
+
+        assert!(
+            tracker.check_done_marker(req_id, output),
+            "Warp 输出网格可能把 `[CCB_END:` 的 tag name 本身拆成 `[CCB_` + `END:`"
         );
     }
 
