@@ -268,6 +268,155 @@ def _find_parent_warp_pid_unix():
     return None
 
 
+def detect_caller():
+    """Auto-detect the calling provider from the process tree.
+
+    Walks parent processes looking for known CLI agent names:
+    claude, codex, gemini, opencode, droid, kimi, goose.
+    Returns the provider name or 'cli' if unknown.
+    """
+    known_agents = {
+        "claude": "claude",
+        "codex": "codex",
+        "gemini": "gemini",
+        "opencode": "opencode",
+        "droid": "droid",
+        "kimi": "kimi",
+        "goose": "goose",
+    }
+
+    try:
+        if sys.platform == "win32":
+            return _detect_caller_windows(known_agents)
+        else:
+            return _detect_caller_unix(known_agents)
+    except Exception:
+        return "cli"
+
+
+def _env_int(name):
+    value = os.environ.get(name)
+    if not value:
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        return None
+
+
+def detect_caller_identity(caller=None):
+    provider = caller or os.environ.get("WARP_CCB_PROVIDER") or detect_caller()
+    return {
+        "caller": provider,
+        "caller_terminal_view_id": _env_int("WARP_CCB_TERMINAL_VIEW_ID"),
+        "caller_session_id": os.environ.get("WARP_CCB_SESSION_ID"),
+        "caller_cwd": os.environ.get("WARP_CCB_CWD") or os.getcwd(),
+    }
+
+
+def _detect_caller_windows(known_agents):
+    """Windows: walk process tree via NtQueryInformationProcess."""
+    import ctypes
+    from ctypes import wintypes
+
+    ntdll = ctypes.windll.ntdll
+    kernel32 = ctypes.windll.kernel32
+
+    class PROCESS_BASIC_INFORMATION(ctypes.Structure):
+        _fields_ = [
+            ("Reserved1", ctypes.c_void_p),
+            ("PebBaseAddress", ctypes.c_void_p),
+            ("Reserved2", ctypes.c_void_p * 2),
+            ("UniqueProcessId", ctypes.c_void_p),
+            ("InheritedFromUniqueProcessId", ctypes.c_void_p),
+        ]
+
+    PROCESS_QUERY_INFORMATION = 0x0400
+    PROCESS_VM_READ = 0x0010
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+
+    seen = set()
+    pid = os.getpid()
+
+    for _ in range(20):
+        if pid in seen:
+            break
+        seen.add(pid)
+
+        try:
+            handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+            if handle:
+                buf = ctypes.create_unicode_buffer(260)
+                size = wintypes.DWORD(260)
+                ctypes.windll.kernel32.QueryFullProcessImageNameW(
+                    handle, 0, buf, ctypes.byref(size)
+                )
+                kernel32.CloseHandle(handle)
+                exe_name = buf.value.rsplit("\\", 1)[-1].lower()
+                # Check against known agent names (e.g. "claude.exe" -> "claude")
+                exe_base = exe_name.rsplit(".", 1)[0] if "." in exe_name else exe_name
+                if exe_base in known_agents:
+                    return known_agents[exe_base]
+        except Exception:
+            pass
+
+        # Get parent PID
+        handle = kernel32.OpenProcess(
+            PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, False, pid
+        )
+        if not handle:
+            break
+
+        pbi = PROCESS_BASIC_INFORMATION()
+        status = ntdll.NtQueryInformationProcess(
+            handle, 0, ctypes.byref(pbi), ctypes.sizeof(pbi), None
+        )
+        kernel32.CloseHandle(handle)
+
+        if status != 0:
+            break
+
+        parent_pid = pbi.InheritedFromUniqueProcessId
+        if not parent_pid:
+            break
+        pid = parent_pid
+
+    return "cli"
+
+
+def _detect_caller_unix(known_agents):
+    """Unix: walk /proc tree looking for known agent process names."""
+    pid = os.getpid()
+    seen = set()
+
+    for _ in range(20):
+        if pid in seen:
+            break
+        seen.add(pid)
+
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                cmdline = f.read().decode("utf-8", errors="replace")
+            for agent_name in known_agents:
+                if agent_name in cmdline.lower():
+                    return known_agents[agent_name]
+        except OSError:
+            break
+
+        try:
+            with open(f"/proc/{pid}/status", "r") as f:
+                for line in f:
+                    if line.startswith("PPid:"):
+                        pid = int(line.split()[1])
+                        break
+                else:
+                    break
+        except OSError:
+            break
+
+    return "cli"
+
+
 def _instance_has_cwd(info, cwd):
     """Quick check: ping the instance and ask for sessions matching cwd."""
     try:
@@ -349,7 +498,7 @@ def call_bus(command, bus_info=None, timeout=DEFAULT_TIMEOUT, cwd=None):
         sock.close()
 
 
-def ask(provider, prompt, req_id=None, caller="cli", cwd=None, session_id=None, queue=False, bus_info=None):
+def ask(provider, prompt, req_id=None, caller=None, cwd=None, session_id=None, queue=False, bus_info=None):
     """Send an ask command to a CLI agent."""
     import uuid
 
@@ -357,14 +506,22 @@ def ask(provider, prompt, req_id=None, caller="cli", cwd=None, session_id=None, 
         ts = time.strftime("%Y%m%d-%H%M%S")
         req_id = f"{ts}-{uuid.uuid4().hex[:8]}"
 
+    caller_identity = detect_caller_identity(caller)
+
     cmd = {
         "type": "ask",
         "provider": provider,
         "prompt": prompt,
         "req_id": req_id,
-        "caller": caller,
+        "caller": caller_identity["caller"],
         "queue": queue,
     }
+    if caller_identity["caller_terminal_view_id"] is not None:
+        cmd["caller_terminal_view_id"] = caller_identity["caller_terminal_view_id"]
+    if caller_identity["caller_session_id"]:
+        cmd["caller_session_id"] = caller_identity["caller_session_id"]
+    if caller_identity["caller_cwd"]:
+        cmd["caller_cwd"] = caller_identity["caller_cwd"]
     if cwd:
         cmd["cwd"] = cwd
     if session_id:
@@ -413,6 +570,30 @@ def list_sessions(cwd=None, bus_info=None):
         cmd["cwd"] = cwd
 
     return call_bus(cmd, bus_info=bus_info, cwd=cwd)
+
+
+def reply(req_id, content, caller=None, bus_info=None):
+    """Submit a reply for a pending request via warp-reply.
+
+    This is the explicit reply path — agent calls warp-reply instead of
+    relying on terminal marker parsing.
+    """
+    caller_identity = detect_caller_identity(caller)
+
+    cmd = {
+        "type": "reply",
+        "req_id": req_id,
+        "content": content,
+        "caller": caller_identity["caller"],
+    }
+    if caller_identity["caller_terminal_view_id"] is not None:
+        cmd["caller_terminal_view_id"] = caller_identity["caller_terminal_view_id"]
+    if caller_identity["caller_session_id"]:
+        cmd["caller_session_id"] = caller_identity["caller_session_id"]
+    if caller_identity["caller_cwd"]:
+        cmd["caller_cwd"] = caller_identity["caller_cwd"]
+
+    return call_bus(cmd, bus_info=bus_info)
 
 
 def cancel(req_id, bus_info=None):

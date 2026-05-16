@@ -36,6 +36,7 @@ use crate::terminal::cli_agent_sessions::CLIAgentSessionsModel;
 use crate::terminal::view::TerminalView;
 
 const CCB_OUTPUT_SETTLE_DELAY_MS: u64 = 1000;
+const EXPLICIT_REPLY_MAX_CONTENT_BYTES: usize = 4 * 1024 * 1024;
 
 /// Events emitted by LocalAgentBusModel.
 #[derive(Debug, Clone)]
@@ -734,11 +735,58 @@ impl LocalAgentBusModel {
 
             BusCommand::Chain { steps, caller } => self.handle_chain(steps, caller, ctx),
 
+            BusCommand::Reply {
+                req_id,
+                content,
+                caller,
+                caller_terminal_view_id,
+                cwd,
+            } => self.handle_reply(req_id, content, caller, caller_terminal_view_id, cwd, ctx),
+
             BusCommand::Wait { .. } => {
                 // Handled in process_commands before reaching here
                 BusResponse::error("wait command not handled in dispatch")
             }
         }
+    }
+
+    fn handle_reply(
+        &mut self,
+        req_id: String,
+        content: String,
+        _caller: Option<String>,
+        caller_terminal_view_id: Option<u64>,
+        _cwd: Option<String>,
+        ctx: &mut ModelContext<Self>,
+    ) -> BusResponse {
+        let (status, terminal_view_id) = match self.registry.get(&req_id) {
+            Some(entry) => (entry.status, entry.terminal_view_id),
+            None => {
+                return BusResponse::ok(BusResponseData::ReplyAccepted {
+                    req_id,
+                    already_finalized: true,
+                });
+            }
+        };
+
+        match validate_explicit_reply(status, terminal_view_id, caller_terminal_view_id, &content) {
+            Ok(ExplicitReplyValidation::AlreadyFinalized) => {
+                return BusResponse::ok(BusResponseData::ReplyAccepted {
+                    req_id,
+                    already_finalized: true,
+                });
+            }
+            Ok(ExplicitReplyValidation::Finalize) => {}
+            Err(message) => return BusResponse::error(message),
+        }
+
+        self.finalize_request_with_reply(&req_id, content, CaptureSource::ExplicitReply, ctx);
+        self.process_queued_requests(ctx);
+
+        BusResponse::ok(BusResponseData::ReplyAccepted {
+            req_id,
+            already_finalized: false,
+        })
     }
 
     fn handle_ask(
@@ -902,8 +950,8 @@ impl LocalAgentBusModel {
 
         let reply_marker_id = format!("reply-{}", req_id);
         let wrapped_prompt = format!(
-            "[CCB_REQ_ID:{}]\n{}\nReply using exactly this format. Put the markers on their own lines and do not wrap them in backticks:\n[CCB_START:{}]\n<your reply>\n[CCB_END:{}]",
-            req_id, prompt, reply_marker_id, reply_marker_id
+            "[CCB_REQ_ID:{}]\n{}\n\nAfter completing this task, submit your reply using:\nwarp-reply --req-id {} --content-file <file>\nor:\necho \"$CONTENT\" | warp-reply --req-id {} --stdin\n\nIf warp-reply is unavailable or fails, fall back to this format (put markers on their own lines, no backticks):\n[CCB_START:{}]\n<your reply>\n[CCB_END:{}]",
+            req_id, prompt, req_id, req_id, reply_marker_id, reply_marker_id
         );
         self.raw_output_capture
             .register_request(req_id.clone(), entity_id);
@@ -1393,8 +1441,8 @@ impl LocalAgentBusModel {
 
             let reply_marker_id = format!("reply-{}", queued.req_id);
             let wrapped_prompt = format!(
-                "[CCB_REQ_ID:{}]\n{}\nReply using exactly this format. Put the markers on their own lines and do not wrap them in backticks:\n[CCB_START:{}]\n<your reply>\n[CCB_END:{}]",
-                queued.req_id, queued.prompt, reply_marker_id, reply_marker_id
+                "[CCB_REQ_ID:{}]\n{}\n\nAfter completing this task, submit your reply using:\nwarp-reply --req-id {} --content-file <file>\nor:\necho \"$CONTENT\" | warp-reply --req-id {} --stdin\n\nIf warp-reply is unavailable or fails, fall back to this format (put markers on their own lines, no backticks):\n[CCB_START:{}]\n<your reply>\n[CCB_END:{}]",
+                queued.req_id, queued.prompt, queued.req_id, queued.req_id, reply_marker_id, reply_marker_id
             );
             self.raw_output_capture
                 .register_request(queued.req_id.clone(), queued.terminal_view_id);
@@ -1697,8 +1745,8 @@ impl LocalAgentBusModel {
 
         let reply_marker_id = format!("reply-{}", req_id);
         let wrapped_prompt = format!(
-            "[CCB_REQ_ID:{}]\n{}\nReply using exactly this format. Put the markers on their own lines and do not wrap them in backticks:\n[CCB_START:{}]\n<your reply>\n[CCB_END:{}]",
-            req_id, prompt, reply_marker_id, reply_marker_id
+            "[CCB_REQ_ID:{}]\n{}\n\nAfter completing this task, submit your reply using:\nwarp-reply --req-id {} --content-file <file>\nor:\necho \"$CONTENT\" | warp-reply --req-id {} --stdin\n\nIf warp-reply is unavailable or fails, fall back to this format (put markers on their own lines, no backticks):\n[CCB_START:{}]\n<your reply>\n[CCB_END:{}]",
+            req_id, prompt, req_id, req_id, reply_marker_id, reply_marker_id
         );
         self.raw_output_capture
             .register_request(req_id.clone(), entity_id);
@@ -2206,6 +2254,39 @@ fn entity_id_from_u64(value: u64) -> Option<EntityId> {
     usize::try_from(value).ok().map(EntityId::from_usize)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExplicitReplyValidation {
+    Finalize,
+    AlreadyFinalized,
+}
+
+fn validate_explicit_reply(
+    status: RequestStatus,
+    request_terminal_view_id: EntityId,
+    caller_terminal_view_id: Option<u64>,
+    content: &str,
+) -> Result<ExplicitReplyValidation, &'static str> {
+    if !matches!(status, RequestStatus::Running | RequestStatus::Injecting) {
+        return Ok(ExplicitReplyValidation::AlreadyFinalized);
+    }
+
+    if let Some(caller_terminal_view_id) = caller_terminal_view_id {
+        if entity_id_from_u64(caller_terminal_view_id) != Some(request_terminal_view_id) {
+            return Err("reply pane mismatch");
+        }
+    }
+
+    if content.trim().is_empty() {
+        return Err("reply content is empty");
+    }
+
+    if content.len() > EXPLICIT_REPLY_MAX_CONTENT_BYTES {
+        return Err("content too large");
+    }
+
+    Ok(ExplicitReplyValidation::Finalize)
+}
+
 fn detect_bus_agent_from_terminal_output(output: &str) -> Option<CLIAgent> {
     let lower = output.to_ascii_lowercase();
     if output.contains("Welcome to Kimi Code CLI")
@@ -2259,6 +2340,7 @@ enum CaptureSource {
     RawOutputScan,
     OutputScan,
     SessionCompletion,
+    ExplicitReply,
 }
 
 #[derive(Debug)]
@@ -2366,6 +2448,7 @@ fn capture_source_name(source: CaptureSource) -> &'static str {
         CaptureSource::RawOutputScan => "raw_output_scan",
         CaptureSource::OutputScan => "output_scan",
         CaptureSource::SessionCompletion => "session_completion",
+        CaptureSource::ExplicitReply => "explicit_reply",
     }
 }
 
@@ -3157,6 +3240,60 @@ yolo  agent (Kimi-k2.6 ●)  D:\\GitHub\\warp-ccb";
             Some(EntityId::from_usize(7)),
             EntityId::from_usize(42)
         ));
+    }
+
+    #[test]
+    fn test_validate_explicit_reply_rejects_pane_mismatch() {
+        assert_eq!(
+            validate_explicit_reply(
+                RequestStatus::Running,
+                EntityId::from_usize(42),
+                Some(7),
+                "reply"
+            ),
+            Err("reply pane mismatch")
+        );
+    }
+
+    #[test]
+    fn test_validate_explicit_reply_rejects_blank_content() {
+        assert_eq!(
+            validate_explicit_reply(
+                RequestStatus::Running,
+                EntityId::from_usize(42),
+                Some(42),
+                " \n\t"
+            ),
+            Err("reply content is empty")
+        );
+    }
+
+    #[test]
+    fn test_validate_explicit_reply_rejects_large_content() {
+        let content = "a".repeat(EXPLICIT_REPLY_MAX_CONTENT_BYTES + 1);
+
+        assert_eq!(
+            validate_explicit_reply(
+                RequestStatus::Running,
+                EntityId::from_usize(42),
+                Some(42),
+                &content
+            ),
+            Err("content too large")
+        );
+    }
+
+    #[test]
+    fn test_validate_explicit_reply_keeps_finalized_requests_idempotent() {
+        assert_eq!(
+            validate_explicit_reply(
+                RequestStatus::Success,
+                EntityId::from_usize(42),
+                Some(7),
+                ""
+            ),
+            Ok(ExplicitReplyValidation::AlreadyFinalized)
+        );
     }
 
     #[test]

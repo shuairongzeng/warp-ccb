@@ -92,6 +92,17 @@ pub enum BusCommand {
         #[serde(skip_serializing_if = "Option::is_none")]
         timeout_ms: Option<u64>,
     },
+    #[serde(alias = "Reply")]
+    Reply {
+        req_id: String,
+        content: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        caller: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        caller_terminal_view_id: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+    },
 }
 
 fn default_caller() -> String {
@@ -177,6 +188,10 @@ pub enum BusResponseData {
         status: RequestStatus,
         content: String,
         elapsed_ms: u64,
+    },
+    ReplyAccepted {
+        req_id: String,
+        already_finalized: bool,
     },
     Error {
         message: String,
@@ -370,6 +385,73 @@ mod tests {
         assert!(json.contains("\"ok\":true"));
         assert!(json.contains("\"type\":\"ask_skipped\""));
         assert!(json.contains("\"reason\":\"self_request_skipped\""));
+    }
+
+    #[test]
+    fn test_deserialize_reply_request() {
+        let json = r#"{
+            "v": 1,
+            "token": "tok",
+            "type": "reply",
+            "req_id": "req-1",
+            "content": "hello",
+            "caller": "codex",
+            "caller_terminal_view_id": 2247,
+            "cwd": "D:\\GitHub\\warp-ccb"
+        }"#;
+
+        let req: BusRequest = serde_json::from_str(json).unwrap();
+        match req.command {
+            BusCommand::Reply {
+                req_id,
+                content,
+                caller,
+                caller_terminal_view_id,
+                cwd,
+            } => {
+                assert_eq!(req_id, "req-1");
+                assert_eq!(content, "hello");
+                assert_eq!(caller.as_deref(), Some("codex"));
+                assert_eq!(caller_terminal_view_id, Some(2247));
+                assert_eq!(cwd.as_deref(), Some("D:\\GitHub\\warp-ccb"));
+            }
+            _ => panic!("expected Reply"),
+        }
+    }
+
+    #[test]
+    fn test_deserialize_reply_request_accepts_pascal_case_type() {
+        let json = r#"{
+            "v": 1,
+            "token": "tok",
+            "type": "Reply",
+            "req_id": "req-1",
+            "content": "hello"
+        }"#;
+
+        let req: BusRequest = serde_json::from_str(json).unwrap();
+        match req.command {
+            BusCommand::Reply {
+                req_id, content, ..
+            } => {
+                assert_eq!(req_id, "req-1");
+                assert_eq!(content, "hello");
+            }
+            _ => panic!("expected Reply"),
+        }
+    }
+
+    #[test]
+    fn test_serialize_reply_accepted_response() {
+        let resp = BusResponse::ok(BusResponseData::ReplyAccepted {
+            req_id: "req-1".to_string(),
+            already_finalized: false,
+        });
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"ok\":true"));
+        assert!(json.contains("\"type\":\"reply_accepted\""));
+        assert!(json.contains("\"req_id\":\"req-1\""));
+        assert!(json.contains("\"already_finalized\":false"));
     }
 
     #[test]

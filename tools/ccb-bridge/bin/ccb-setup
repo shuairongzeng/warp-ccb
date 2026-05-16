@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python
 """ccb-setup — Install CCB Warp LocalAgentBus tools
 
 Adds ccb-bridge/bin to PATH and installs skills for Claude and Codex.
@@ -18,14 +18,14 @@ SKILLS_DIR = os.path.join(BRIDGE_DIR, "skills")
 
 CLAUDE_SKILL = r'''---
 name: warp-ask
-description: Send a message to another AI agent via Warp LocalAgentBus and wait for reply. Use this to collaborate with other agents (claude/codex/gemini/opencode/droid). This is a BLOCKING call - it waits for the reply.
+description: Send a message to another AI agent via Warp LocalAgentBus. Default is async (non-blocking). Use this to collaborate with other agents (claude/codex/gemini/opencode/droid/kimi/goose).
 metadata:
-  short-description: Send message to another agent and wait for reply
+  short-description: Send message to another agent (async by default)
 ---
 
 # Warp Ask - Cross-Agent Communication
 
-Send a message to another AI agent running in Warp and wait for the reply.
+Send a message to another AI agent running in Warp.
 
 ## Available Agents
 
@@ -34,6 +34,8 @@ Send a message to another AI agent running in Warp and wait for the reply.
 - `gemini` - Gemini (Google)
 - `opencode` - OpenCode
 - `droid` - Droid
+- `kimi` - Kimi (Moonshot)
+- `goose` - Goose (Block)
 
 ## Multi-Instance Auto-Isolation
 
@@ -48,36 +50,70 @@ warp-ping $PROVIDER
 
 If "not online", report that the agent is unavailable.
 
-## Step 2: Send Message (MANDATORY)
+## Step 2: Send Message — Async (DEFAULT)
 
-```powershell
-warp-ask $PROVIDER "$MESSAGE" --wait --timeout 60
-```
-
-## Async Mode
+Always use async mode. This does NOT block — you can send multiple messages
+and do other work while waiting for replies.
 
 ```powershell
 warp-ask $PROVIDER "$MESSAGE" --caller claude
 ```
 
-Check later: `warp-pend $PROVIDER`
+Returns immediately with a `req_id`. Remember it.
+
+## Step 3: Wait for Reply (BACKGROUND)
+
+When you need the reply before continuing, use `warp-wait` in a **background Bash** process (NO timeout). You will be automatically notified when it completes.
+
+```powershell
+# Use Bash tool with run_in_background=true
+warp-wait $REQ_ID
+```
+
+Do NOT use `--timeout` — the background process will wait until the reply arrives.
+
+You can also check status at any time with:
+
+```powershell
+warp-pend $PROVIDER
+```
+
+Or check a specific request: `warp-pend $PROVIDER --req-id $REQ_ID`
+
+## Blocking Mode (AVOID)
+
+Do NOT use `--wait` on `warp-ask` — it blocks the entire session. Always prefer async send + background `warp-wait`.
+
+```powershell
+# AVOID this — blocks entire session:
+warp-ask $PROVIDER "$MESSAGE" --wait --timeout 60
+```
+
+## Rules
+
+- Default to async mode for sending (`warp-ask` without `--wait`).
+- When you need the reply, launch `warp-wait $REQ_ID` as a **background Bash** process (run_in_background=true, NO timeout).
+- You can send to multiple providers without waiting for each reply.
+- After background wait completes, use `warp-pend $PROVIDER` to read the reply.
 
 ## Examples
 
-- `warp-ping codex`
-- `warp-ask codex "What is 2+2?" --wait`
+- `warp-ping codex` — check if codex is online
+- `warp-ask codex "What is 2+2?" --caller claude` — async send
+- Background Bash: `warp-wait 20260514-1234-abcd` — wait for reply (notified on completion)
+- `warp-pend codex` — check latest reply from codex
 '''
 
 CODEX_SKILL = r'''---
 name: warp-ask
-description: Send a message to another AI agent via Warp LocalAgentBus and wait for reply. Use this to collaborate with other agents (claude/codex/gemini/opencode/droid). This is a BLOCKING call - it waits for the reply.
+description: Send a message to another AI agent via Warp LocalAgentBus. Default is async (non-blocking). Use this to collaborate with other agents (claude/codex/gemini/opencode/droid/kimi/goose).
 metadata:
-  short-description: Send message to another agent and wait for reply
+  short-description: Send message to another agent (async by default)
 ---
 
 # Warp Ask - Cross-Agent Communication
 
-Send a message to another AI agent running in Warp and wait for the reply.
+Send a message to another AI agent running in Warp.
 
 ## Available Agents
 
@@ -86,6 +122,8 @@ Send a message to another AI agent running in Warp and wait for the reply.
 - `gemini` - Gemini (Google)
 - `opencode` - OpenCode
 - `droid` - Droid
+- `kimi` - Kimi (Moonshot)
+- `goose` - Goose (Block)
 
 ## Multi-Instance Auto-Isolation
 
@@ -100,24 +138,56 @@ warp-ping $PROVIDER
 
 If "not online", report that the agent is unavailable.
 
-## Step 2: Send Message (MANDATORY)
+## Step 2: Send Message — Async (DEFAULT)
 
-```bash
-warp-ask $PROVIDER "$MESSAGE" --wait --timeout 60
-```
-
-## Async Mode
+Always use async mode. This does NOT block — you can send multiple messages
+and do other work while waiting for replies.
 
 ```bash
 warp-ask $PROVIDER "$MESSAGE" --caller codex
 ```
 
-Check later: `warp-pend $PROVIDER`
+Returns immediately with a `req_id`. Remember it.
+
+## Step 3: Wait for Reply (BACKGROUND)
+
+When you need the reply before continuing, use `warp-wait` in a **background** process (NO timeout). You will be automatically notified when it completes.
+
+```bash
+# Run in background (no --timeout)
+warp-wait $REQ_ID &
+```
+
+You can also check status at any time with:
+
+```bash
+warp-pend $PROVIDER
+```
+
+Or check a specific request: `warp-pend $PROVIDER --req-id $REQ_ID`
+
+## Blocking Mode (AVOID)
+
+Do NOT use `--wait` on `warp-ask` — it blocks the entire session. Always prefer async send + background `warp-wait`.
+
+```bash
+# AVOID this — blocks entire session:
+warp-ask $PROVIDER "$MESSAGE" --wait --timeout 60
+```
+
+## Rules
+
+- Default to async mode for sending (`warp-ask` without `--wait`).
+- When you need the reply, launch `warp-wait $REQ_ID` as a **background** process (NO timeout).
+- You can send to multiple providers without waiting for each reply.
+- After background wait completes, use `warp-pend $PROVIDER` to read the reply.
 
 ## Examples
 
-- `warp-ping claude`
-- `warp-ask claude "What is 2+2?" --wait`
+- `warp-ping claude` — check if claude is online
+- `warp-ask claude "What is 2+2?" --caller codex` — async send
+- Background: `warp-wait 20260514-1234-abcd &` — wait for reply (notified on completion)
+- `warp-pend claude` — check latest reply from claude
 '''
 
 CLAUDE_PING_SKILL = r'''---
@@ -133,7 +203,7 @@ Check if an AI agent is online and reachable via Warp LocalAgentBus.
 
 ## Available Agents
 
-- `claude`, `codex`, `gemini`, `opencode`, `droid`
+- `claude`, `codex`, `gemini`, `opencode`, `droid`, `kimi`, `goose`
 
 ## Execution (MANDATORY)
 
@@ -166,7 +236,7 @@ Check if an AI agent is online and reachable via Warp LocalAgentBus.
 
 ## Available Agents
 
-- `claude`, `codex`, `gemini`, `opencode`, `droid`
+- `claude`, `codex`, `gemini`, `opencode`, `droid`, `kimi`, `goose`
 
 ## Execution (MANDATORY)
 
@@ -187,11 +257,109 @@ warp-ping $PROVIDER
 '''
 
 
+CLAUDE_REPLY_SKILL = r'''---
+name: warp-reply
+description: Reply to an incoming CCB request via Warp LocalAgentBus. Preferred over terminal markers.
+metadata:
+  short-description: Reply to a CCB request reliably
+---
+
+# Warp Reply - Submit Response
+
+Use this when you receive a request containing `[CCB_REQ_ID:<id>]` to submit your response back to the Bus.
+
+## Step 1: Prepare Reply
+
+Complete the requested task. If the reply is long, save it to a temporary file.
+
+## Step 2: Submit via warp-reply (PREFERRED)
+
+```powershell
+# File mode — recommended for long replies
+warp-reply --req-id $REQ_ID --content-file $FILE_PATH
+
+# Stdin mode — for short replies
+echo "$CONTENT" | warp-reply --req-id $REQ_ID --stdin
+```
+
+Parameters:
+- --req-id (required): The request ID from [CCB_REQ_ID:<id>]
+- --content-file (optional): Path to file containing the reply
+- --stdin (optional): Read reply content from standard input
+- --content (optional): Inline text for very short replies only
+
+## Step 3: Fallback to Markers (if warp-reply fails)
+
+If warp-reply is not available or returns non-zero, fall back to terminal markers:
+
+```
+[CCB_START:<reply-id>]
+<your reply>
+[CCB_END:<reply-id>]
+```
+
+## Rules
+
+- ALWAYS try warp-reply first. Only fall back to markers if the command fails.
+- Do NOT use both warp-reply and markers for the same request.
+- Prefer --content-file over --content to avoid shell escaping issues.
+'''
+
+CODEX_REPLY_SKILL = r'''---
+name: warp-reply
+description: Reply to an incoming CCB request via Warp LocalAgentBus. Preferred over terminal markers.
+metadata:
+  short-description: Reply to a CCB request reliably
+---
+
+# Warp Reply - Submit Response
+
+Use this when you receive a request containing `[CCB_REQ_ID:<id>]` to submit your response back to the Bus.
+
+## Step 1: Prepare Reply
+
+Complete the requested task. If the reply is long, save it to a temporary file.
+
+## Step 2: Submit via warp-reply (PREFERRED)
+
+```bash
+# File mode — recommended for long replies
+warp-reply --req-id $REQ_ID --content-file $FILE_PATH
+
+# Stdin mode — for short replies
+echo "$CONTENT" | warp-reply --req-id $REQ_ID --stdin
+```
+
+Parameters:
+- --req-id (required): The request ID from [CCB_REQ_ID:<id>]
+- --content-file (optional): Path to file containing the reply
+- --stdin (optional): Read reply content from standard input
+- --content (optional): Inline text for very short replies only
+
+## Step 3: Fallback to Markers (if warp-reply fails)
+
+If warp-reply is not available or returns non-zero, fall back to terminal markers:
+
+```
+[CCB_START:<reply-id>]
+<your reply>
+[CCB_END:<reply-id>]
+```
+
+## Rules
+
+- ALWAYS try warp-reply first. Only fall back to markers if the command fails.
+- Do NOT use both warp-reply and markers for the same request.
+- Prefer --content-file over --content to avoid shell escaping issues.
+'''
+
+
 def install_skills():
-    """Install warp-ask and warp-ping skills for Claude and Codex."""
+    """Install warp-ask, warp-ping, and warp-reply skills for Claude and Codex."""
     skills = [
         ("warp-ask", CLAUDE_SKILL, CODEX_SKILL),
         ("warp-ping", CLAUDE_PING_SKILL, CODEX_PING_SKILL),
+        ("warp-reply", CLAUDE_REPLY_SKILL, CODEX_REPLY_SKILL),
     ]
     for skill_name, claude_content, codex_content in skills:
         # Claude skill
@@ -278,7 +446,7 @@ def main():
 
     print("\n=== Setup Complete ===")
     print("Restart your terminal for PATH changes to take effect.")
-    print("Installed skills: warp-ask, warp-ping (for Claude and Codex)")
+    print("Installed skills: warp-ask, warp-ping, warp-reply (for Claude and Codex)")
     print("Then run: warp-ping claude")
 
 
