@@ -194,7 +194,12 @@ impl LocalAgentBusModel {
     /// Remove a terminal handle when the session ends.
     pub fn deregister_terminal_handle(&mut self, view_id: EntityId) {
         self.terminal_handles.remove(&view_id);
-        self.bus_launched_sessions.remove(&view_id);
+        let removed_agent = self.bus_launched_sessions.remove(&view_id);
+        log::info!(
+            "CCB会话注销: pane={} removed_bus_provider={:?}",
+            view_id,
+            removed_agent.map(|agent| agent.command_prefix())
+        );
         self.raw_output_capture.deregister_pane(view_id);
     }
 
@@ -762,10 +767,7 @@ impl LocalAgentBusModel {
         let (status, terminal_view_id) = match self.registry.get(&req_id) {
             Some(entry) => (entry.status, entry.terminal_view_id),
             None => {
-                return BusResponse::ok(BusResponseData::ReplyAccepted {
-                    req_id,
-                    already_finalized: true,
-                });
+                return BusResponse::error(format!("reply request not found: {}", req_id));
             }
         };
 
@@ -1477,9 +1479,7 @@ impl LocalAgentBusModel {
             None => return FindSessionResult::NotFound,
         };
 
-        if !is_agent_supported(&target_agent) {
-            self.refresh_bus_launched_sessions_from_terminal_outputs(ctx);
-        }
+        self.refresh_bus_launched_sessions_from_terminal_outputs(ctx);
 
         let sessions_model = CLIAgentSessionsModel::as_ref(ctx);
 
@@ -1954,24 +1954,45 @@ impl LocalAgentBusModel {
 
     /// Find a terminal without an active CLI agent session AND without active requests.
     fn find_idle_terminal(&self, ctx: &mut ModelContext<Self>) -> Option<EntityId> {
-        let sessions_model = CLIAgentSessionsModel::as_ref(ctx);
+        let active_session_views: HashSet<EntityId> = {
+            let sessions_model = CLIAgentSessionsModel::as_ref(ctx);
+            sessions_model
+                .iter_sessions()
+                .map(|(view_id, _, _)| view_id)
+                .collect()
+        };
         log::info!(
             "LocalAgentBus: find_idle_terminal — checking {} handles",
             self.terminal_handles.len()
         );
 
-        for &view_id in self.terminal_handles.keys() {
-            let has_session = sessions_model.session(view_id).is_some();
+        let handles: Vec<(EntityId, WeakViewHandle<TerminalView>)> = self
+            .terminal_handles
+            .iter()
+            .map(|(view_id, handle)| (*view_id, handle.clone()))
+            .collect();
+
+        for (view_id, weak_handle) in handles {
+            let has_session = active_session_views.contains(&view_id);
             let has_bus_launched = self.bus_launched_sessions.contains_key(&view_id);
             let has_active = self.registry.has_active_for_terminal(view_id);
+            let has_running_block = match weak_handle.upgrade(ctx) {
+                Some(handle) => handle.update(ctx, |view, _ctx| {
+                    let model = view.model.lock();
+                    let active_block = model.block_list().active_block();
+                    active_block_blocks_bus_launch(active_block.started(), active_block.finished())
+                }),
+                None => true,
+            };
             log::info!(
-                "LocalAgentBus:   terminal {:?} — session={}, bus_launched={}, active={}",
+                "LocalAgentBus:   terminal {:?} — session={}, bus_launched={}, active={}, running_block={}",
                 view_id,
                 has_session,
                 has_bus_launched,
-                has_active
+                has_active,
+                has_running_block
             );
-            if !has_session && !has_bus_launched && !has_active {
+            if !has_session && !has_bus_launched && !has_active && !has_running_block {
                 return Some(view_id);
             }
         }
@@ -2266,8 +2287,12 @@ fn validate_explicit_reply(
     caller_terminal_view_id: Option<u64>,
     content: &str,
 ) -> Result<ExplicitReplyValidation, &'static str> {
-    if !matches!(status, RequestStatus::Running | RequestStatus::Injecting) {
+    if matches!(status, RequestStatus::Success) {
         return Ok(ExplicitReplyValidation::AlreadyFinalized);
+    }
+
+    if !matches!(status, RequestStatus::Running | RequestStatus::Injecting) {
+        return Err("reply request is not running");
     }
 
     if let Some(caller_terminal_view_id) = caller_terminal_view_id {
@@ -2287,14 +2312,53 @@ fn validate_explicit_reply(
     Ok(ExplicitReplyValidation::Finalize)
 }
 
+fn active_block_blocks_bus_launch(started: bool, finished: bool) -> bool {
+    started && !finished
+}
+
 fn detect_bus_agent_from_terminal_output(output: &str) -> Option<CLIAgent> {
     let lower = output.to_ascii_lowercase();
+    for (provider, agent) in [
+        ("claude", CLIAgent::Claude),
+        ("codex", CLIAgent::Codex),
+        ("gemini", CLIAgent::Gemini),
+        ("opencode", CLIAgent::OpenCode),
+        ("droid", CLIAgent::Droid),
+        ("kimi", CLIAgent::Kimi),
+        ("goose", CLIAgent::Goose),
+    ] {
+        if lower.contains(&format!("warp_ccb_provider='{}'", provider))
+            || lower.contains(&format!("warp_ccb_provider=\"{}\"", provider))
+            || lower.contains(&format!("warp_ccb_provider={}", provider))
+        {
+            return Some(agent);
+        }
+    }
+
     if output.contains("Welcome to Kimi Code CLI")
         || output.contains("Kimi Code CLI!")
         || output.contains("Model: Kimi-")
         || lower.contains("kimi_cli")
     {
         return Some(CLIAgent::Kimi);
+    }
+
+    if lower.contains("gpt-")
+        && output.contains('·')
+        && (lower.contains(" xhigh ")
+            || lower.contains(" high ")
+            || lower.contains(" medium ")
+            || lower.contains(" low "))
+    {
+        return Some(CLIAgent::Codex);
+    }
+
+    if lower.contains("droid") && (output.contains('⛬') || lower.contains("factory")) {
+        return Some(CLIAgent::Droid);
+    }
+
+    if lower.contains("claude code") || lower.contains("@anthropic-ai/claude-code") {
+        return Some(CLIAgent::Claude);
     }
 
     None
@@ -3297,6 +3361,29 @@ yolo  agent (Kimi-k2.6 ●)  D:\\GitHub\\warp-ccb";
     }
 
     #[test]
+    fn test_validate_explicit_reply_rejects_non_success_final_states() {
+        for status in [
+            RequestStatus::Queued,
+            RequestStatus::Error,
+            RequestStatus::Timeout,
+            RequestStatus::Cancelled,
+            RequestStatus::SessionBusy,
+        ] {
+            assert_eq!(
+                validate_explicit_reply(status, EntityId::from_usize(42), Some(42), "reply"),
+                Err("reply request is not running")
+            );
+        }
+    }
+
+    #[test]
+    fn test_active_block_blocks_bus_launch_when_command_is_running() {
+        assert!(active_block_blocks_bus_launch(true, false));
+        assert!(!active_block_blocks_bus_launch(false, false));
+        assert!(!active_block_blocks_bus_launch(true, true));
+    }
+
+    #[test]
     fn test_detect_bus_agent_from_kimi_banner() {
         let output = "\
 ╭──────────────────────────────────────────────────────────╮
@@ -3306,6 +3393,29 @@ yolo  agent (Kimi-k2.6 ●)  D:\\GitHub\\warp-ccb";
         assert_eq!(
             detect_bus_agent_from_terminal_output(output),
             Some(CLIAgent::Kimi)
+        );
+    }
+
+    #[test]
+    fn test_detect_bus_agent_from_codex_output() {
+        let output = "\
+gpt-5.5 xhigh · D:\\GitHub\\warp-ccb
+
+› Ready for work";
+        assert_eq!(
+            detect_bus_agent_from_terminal_output(output),
+            Some(CLIAgent::Codex)
+        );
+    }
+
+    #[test]
+    fn test_detect_bus_agent_from_droid_output() {
+        let output = "\
+⛬ Droid
+D:\\GitHub\\warp-ccb";
+        assert_eq!(
+            detect_bus_agent_from_terminal_output(output),
+            Some(CLIAgent::Droid)
         );
     }
 

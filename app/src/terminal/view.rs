@@ -4266,14 +4266,15 @@ impl TerminalView {
         };
         terminal_view.register_subscriptions_for_use_agent_footer(ctx);
 
-        // Register this terminal view with LocalAgentBus for auto-launch support.
-        {
-            let view_id = terminal_view.view_id;
+        // 延迟注册，避免 Bus 创建新 pane 时 TerminalView::new() 反向同步更新 Bus
+        // 触发 Circular model update。
+        ctx.spawn(async move {}, move |me, _, ctx| {
+            let view_id = me.view_id;
             let weak_handle = ctx.handle();
             crate::ai::local_agent_bus::LocalAgentBusModel::handle(ctx).update(ctx, |bus, _ctx| {
                 bus.register_terminal_handle(view_id, weak_handle);
             });
-        }
+        });
 
         if let Some(raw_reads_rx) = local_agent_bus_raw_reads_rx {
             let view_id = terminal_view.view_id;

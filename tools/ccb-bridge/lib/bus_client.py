@@ -580,6 +580,8 @@ def reply(req_id, content, caller=None, bus_info=None):
     """
     caller_identity = detect_caller_identity(caller)
 
+    caller_cwd = caller_identity["caller_cwd"]
+
     cmd = {
         "type": "reply",
         "req_id": req_id,
@@ -590,10 +592,10 @@ def reply(req_id, content, caller=None, bus_info=None):
         cmd["caller_terminal_view_id"] = caller_identity["caller_terminal_view_id"]
     if caller_identity["caller_session_id"]:
         cmd["caller_session_id"] = caller_identity["caller_session_id"]
-    if caller_identity["caller_cwd"]:
-        cmd["caller_cwd"] = caller_identity["caller_cwd"]
+    if caller_cwd:
+        cmd["cwd"] = caller_cwd
 
-    return call_bus(cmd, bus_info=bus_info)
+    return call_bus(cmd, bus_info=bus_info, cwd=caller_cwd)
 
 
 def cancel(req_id, bus_info=None):
@@ -621,13 +623,13 @@ def launch(provider, prompt=None, cwd=None, bus_info=None, auto_tab=True):
     if cwd:
         cmd["cwd"] = cwd
 
-    result = call_bus(cmd, bus_info=bus_info)
+    result = call_bus(cmd, bus_info=bus_info, cwd=cwd)
 
     # If no idle terminal, try opening a new Warp tab and retry.
     if auto_tab and not result.get("ok") and "no idle terminal" in result.get("message", ""):
         _open_new_warp_tab()
         time.sleep(3)
-        result = call_bus(cmd, bus_info=bus_info)
+        result = call_bus(cmd, bus_info=bus_info, cwd=cwd)
 
     return result
 

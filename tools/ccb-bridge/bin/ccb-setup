@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 """ccb-setup — Install CCB Warp LocalAgentBus tools
 
 Adds ccb-bridge/bin to PATH and installs skills for Claude and Codex.
@@ -293,9 +293,9 @@ Parameters:
 If warp-reply is not available or returns non-zero, fall back to terminal markers:
 
 ```
-[CCB_START:<reply-id>]
+[CCB_START:reply-<REQ_ID>]
 <your reply>
-[CCB_END:<reply-id>]
+[CCB_END:reply-<REQ_ID>]
 ```
 
 ## Rules
@@ -341,9 +341,9 @@ Parameters:
 If warp-reply is not available or returns non-zero, fall back to terminal markers:
 
 ```
-[CCB_START:<reply-id>]
+[CCB_START:reply-<REQ_ID>]
 <your reply>
-[CCB_END:<reply-id>]
+[CCB_END:reply-<REQ_ID>]
 ```
 
 ## Rules

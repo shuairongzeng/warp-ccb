@@ -100,7 +100,7 @@ pub enum BusCommand {
         caller: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         caller_terminal_view_id: Option<u64>,
-        #[serde(skip_serializing_if = "Option::is_none")]
+        #[serde(skip_serializing_if = "Option::is_none", alias = "caller_cwd")]
         cwd: Option<String>,
     },
 }
@@ -436,6 +436,26 @@ mod tests {
             } => {
                 assert_eq!(req_id, "req-1");
                 assert_eq!(content, "hello");
+            }
+            _ => panic!("expected Reply"),
+        }
+    }
+
+    #[test]
+    fn test_deserialize_reply_request_accepts_caller_cwd_alias() {
+        let json = r#"{
+            "v": 1,
+            "token": "tok",
+            "type": "reply",
+            "req_id": "req-1",
+            "content": "hello",
+            "caller_cwd": "D:\\GitHub\\warp-ccb"
+        }"#;
+
+        let req: BusRequest = serde_json::from_str(json).unwrap();
+        match req.command {
+            BusCommand::Reply { cwd, .. } => {
+                assert_eq!(cwd.as_deref(), Some("D:\\GitHub\\warp-ccb"));
             }
             _ => panic!("expected Reply"),
         }

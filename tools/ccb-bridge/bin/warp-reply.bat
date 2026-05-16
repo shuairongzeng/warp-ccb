@@ -1,2 +1,2 @@
 @echo off
-python "%~dp0warp-reply" %*
+C:\Python314\python.exe "%~dp0warp-reply" %*
