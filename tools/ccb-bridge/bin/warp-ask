@@ -59,6 +59,12 @@ def main():
             print(f"Error: {response.get('message', 'unknown error')}", file=sys.stderr)
             sys.exit(1)
 
+        if response.get("type") == "ask_skipped":
+            print(f"[CCB_SKIPPED provider={provider}]")
+            print(f"req_id: {response.get('req_id', req_id)}")
+            print(f"reason: {response.get('reason', 'self_request_skipped')}")
+            return
+
         if do_wait:
             print(f"[{req_id}] waiting for {provider}...")
             result = wait(req_id=req_id, timeout=wait_timeout, cwd=cwd)

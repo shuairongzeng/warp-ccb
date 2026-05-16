@@ -60,13 +60,21 @@ impl CompletionTracker {
 
     /// Check if a completion marker was found in output text.
     ///
-    /// Detects `[CCB_END:{req_id}]` that is NOT wrapped in backticks.
-    /// Instruction markers are backtick-wrapped (`` `[CCB_END:xxx]` ``),
-    /// agent markers are plain (`[CCB_END:xxx]`), so we skip backtick-wrapped ones.
+    /// 优先检测最后一个有效 `[CCB_START:reply-{req_id}]... [CCB_END:reply-{req_id}]`
+    /// 闭环。提示词和思考文本可能会复述 marker，所以不能只看第一个 END。
     /// Falls back to old format: CCB_DONE:{req_id} on its own line.
     pub fn check_done_marker(&self, req_id: &str, output: &str) -> bool {
         for marker_id in reply_marker_ids(req_id) {
-            if find_terminal_unwrapped_ccb_tag_range(output, "CCB_END", &marker_id).is_some() {
+            let start_ranges = find_unwrapped_ccb_tag_ranges(output, "CCB_START", &marker_id);
+            if find_last_complete_reply_span(output, &marker_id).is_some() {
+                return true;
+            }
+
+            // 兼容早期只输出 END/CCB_DONE 的场景；一旦已经出现 START，就不再用
+            // END-only fallback，避免把提示词或思考文本里的 marker 当成完成信号。
+            if start_ranges.is_empty()
+                && find_terminal_unwrapped_ccb_tag_range(output, "CCB_END", &marker_id).is_some()
+            {
                 return true;
             }
         }
@@ -164,58 +172,167 @@ pub(crate) fn find_unwrapped_ccb_tag_ranges(
     tag_name: &str,
     req_id: &str,
 ) -> Vec<(usize, usize)> {
-    let prefix = format!("[{}:", tag_name);
     let mut ranges = Vec::new();
-    let mut search_from = 0;
+    for prefix in ccb_tag_prefixes(tag_name) {
+        let mut search_from = 0;
 
-    while search_from < output.len() {
-        let Some(offset) = output[search_from..].find(&prefix) else {
-            break;
-        };
-        let start = search_from + offset;
-        let mut idx = start + prefix.len();
-        let mut matched = true;
-
-        for expected in req_id.chars() {
-            idx = skip_whitespace_at(output, idx);
-            match next_char_at(output, idx) {
-                Some((ch, next_idx)) if ch == expected => {
-                    idx = next_idx;
-                }
-                _ => {
-                    matched = false;
-                }
-            }
-            if !matched {
+        while search_from < output.len() {
+            let Some(offset) = output[search_from..].find(&prefix) else {
                 break;
+            };
+            let start = search_from + offset;
+            if !is_valid_ccb_tag_prefix_occurrence(output, start, &prefix, tag_name) {
+                search_from = start + prefix.len();
+                continue;
             }
-        }
 
-        if matched {
-            idx = skip_whitespace_at(output, idx);
-            match next_char_at(output, idx) {
-                Some((ch, next_idx)) if ch == ']' => {
-                    let preceded_by_backtick = output[..start].chars().next_back() == Some('`');
-                    let followed_by_backtick = output[next_idx..].chars().next() == Some('`');
-                    if !preceded_by_backtick && !followed_by_backtick {
-                        ranges.push((start, next_idx));
+            let mut idx = start + prefix.len();
+            let mut matched = true;
+
+            for expected in req_id.chars() {
+                idx = skip_whitespace_at(output, idx);
+                match next_char_at(output, idx) {
+                    Some((ch, next_idx)) if ch == expected => {
+                        idx = next_idx;
                     }
-                    search_from = next_idx;
+                    _ => {
+                        matched = false;
+                    }
                 }
-                _ => {
-                    search_from = start + prefix.len();
+                if !matched {
+                    break;
                 }
             }
-        } else {
-            search_from = start + prefix.len();
+
+            if matched {
+                idx = skip_whitespace_at(output, idx);
+                match next_char_at(output, idx) {
+                    Some((ch, next_idx)) if ch == ']' => {
+                        let preceded_by_backtick = output[..start].chars().next_back() == Some('`');
+                        let followed_by_backtick = output[next_idx..].chars().next() == Some('`');
+                        if !preceded_by_backtick && !followed_by_backtick {
+                            ranges.push((start, next_idx));
+                        }
+                        search_from = next_idx;
+                    }
+                    _ => {
+                        search_from = start + prefix.len();
+                    }
+                }
+            } else {
+                search_from = start + prefix.len();
+            }
         }
     }
 
+    ranges.sort_unstable();
+    ranges.dedup();
     ranges
+}
+
+fn ccb_tag_prefixes(tag_name: &str) -> Vec<String> {
+    if tag_name == "CCB_END" {
+        vec![
+            "[CCB_END:".to_string(),
+            "CCB_END:".to_string(),
+            "B_END:".to_string(),
+        ]
+    } else {
+        vec![format!("[{}:", tag_name)]
+    }
+}
+
+fn is_valid_ccb_tag_prefix_occurrence(
+    output: &str,
+    start: usize,
+    prefix: &str,
+    tag_name: &str,
+) -> bool {
+    if tag_name != "CCB_END" {
+        return true;
+    }
+
+    let before = &output[..start];
+    match prefix {
+        "CCB_END:" => !before.ends_with('['),
+        "B_END:" => !before.ends_with("[CC") && !before.ends_with("CC"),
+        _ => true,
+    }
 }
 
 pub(crate) fn reply_marker_ids(req_id: &str) -> Vec<String> {
     vec![format!("reply-{}", req_id), req_id.to_string()]
+}
+
+pub(crate) fn find_last_complete_reply_span(
+    output: &str,
+    marker_id: &str,
+) -> Option<(usize, usize)> {
+    let start_ranges = find_unwrapped_ccb_tag_ranges(output, "CCB_START", marker_id);
+    let end_ranges = find_unwrapped_ccb_tag_ranges(output, "CCB_END", marker_id);
+
+    for (end_pos, end_after) in end_ranges.iter().rev().copied() {
+        if !has_protocol_end_context(output, end_after) {
+            continue;
+        }
+
+        let Some((_start_pos, content_start)) =
+            start_ranges
+                .iter()
+                .rev()
+                .copied()
+                .find(|(start_pos, content_start)| {
+                    *start_pos < end_pos
+                        && *content_start <= end_pos
+                        && has_protocol_start_context(output, *start_pos)
+                })
+        else {
+            continue;
+        };
+
+        let Some(reply) = output.get(content_start..end_pos) else {
+            continue;
+        };
+
+        if is_valid_reply_content(reply) {
+            return Some((content_start, end_pos));
+        }
+    }
+
+    None
+}
+
+pub(crate) fn is_valid_reply_content(reply: &str) -> bool {
+    let reply = reply.trim();
+    !reply.is_empty() && !is_instruction_like_reply_content(reply)
+}
+
+fn is_instruction_like_reply_content(reply: &str) -> bool {
+    reply.contains("on its own line")
+        || reply.contains("Before your final reply")
+        || reply.contains("After your final reply")
+        || reply.contains("Reply using exactly this format")
+        || reply.contains("without backticks")
+        || reply.contains("<your reply>")
+}
+
+fn has_protocol_start_context(output: &str, marker_start: usize) -> bool {
+    let line_start = output[..marker_start]
+        .rfind('\n')
+        .map(|p| p + 1)
+        .unwrap_or(0);
+    let prefix = &output[line_start..marker_start];
+    let compact: String = prefix.chars().filter(|ch| !ch.is_whitespace()).collect();
+
+    compact.is_empty() || matches!(compact.as_str(), "●" | "•" | "⛬" | "▎" | "┃")
+}
+
+fn has_protocol_end_context(output: &str, marker_end: usize) -> bool {
+    let line_end = output[marker_end..]
+        .find('\n')
+        .map(|p| marker_end + p)
+        .unwrap_or(output.len());
+    output[marker_end..line_end].trim().is_empty()
 }
 
 pub(crate) fn find_terminal_unwrapped_ccb_tag_range(
@@ -446,6 +563,58 @@ GLM-5.1 [GLM Coding Plan China] - Openai […]
 
   gpt-5.5 xhigh · D:\\GitHub\\warp-ccb";
         assert!(tracker.check_done_marker(req_id, output));
+    }
+
+    #[test]
+    fn test_done_marker_uses_last_valid_reply_closure() {
+        let tracker = CompletionTracker::new();
+        let req_id = "20260515-225555-979c6156";
+        let output = "\
+[CCB_REQ_ID:20260515-225555-979c6156]
+介绍一下自己
+Reply using exactly this format. Put the markers on their own lines and do not wrap them in backticks:
+[CCB_START:reply-20260515-225555-979c6156]
+<your reply>
+[CCB_END:reply-20260515-225555-979c6156]
+• 用户要求我介绍自己，并使用特定的格式回复。格式要求：
+  1. 使用 [CCB_START:reply-20260515-225555-979c6156] 标记开始
+  2. 使用 [CCB_END:reply-20260515-225555-979c6156] 标记结束
+• [CCB_START:reply-20260515-225555-979c6156]
+你好！我是 Kimi Code CLI。
+[CCB_END:reply-20260515-225555-979c6156]
+后面出现新的交互提示或任意终端内容";
+
+        assert!(
+            tracker.check_done_marker(req_id, output),
+            "应识别最后一个有效 START/END 闭环，而不是被前面的 instruction marker 或 END 后尾巴阻塞"
+        );
+    }
+
+    #[test]
+    fn test_done_marker_allows_truncated_grid_end_prefix() {
+        let tracker = CompletionTracker::new();
+        let req_id = "20260516-001753-d6940bd4";
+        let output = "\
+[CCB_REQ_ID:20260516-001753-d6940bd4]
+Reply using exactly this format. Put the markers on their own lines and do not wrap them in backticks:
+[CCB_START:reply-20260516-001753-d6940bd4]
+<your reply>
+[CCB_END:reply-20260516-001753-d6940bd4]
+
+• [CCB_START:reply-20260516-001753-d6940bd4
+  ]
+  1. 容错与恢复：保障多智能体协作的可靠性。
+  2. 智能路由：降低耦合并提升系统扩展性。
+  3. 全链路可观测：缩短跨 Agent 故障定位时间。
+     B_END:reply-20260516-001753-d6940bd4]
+
+── input ─────────────────────────────────
+yolo  agent (Kimi-k2.6 ●)  D:\\GitHub\\warp-ccb";
+
+        assert!(
+            tracker.check_done_marker(req_id, output),
+            "Warp 输出网格可能在行尾裁掉 END marker 的 `[CC` 前缀，仍应识别真实回复闭环"
+        );
     }
 
     #[test]

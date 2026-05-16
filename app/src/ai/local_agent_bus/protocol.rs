@@ -139,6 +139,11 @@ pub enum BusResponseData {
         session_id: Option<String>,
         provider: String,
     },
+    AskSkipped {
+        req_id: String,
+        provider: String,
+        reason: String,
+    },
     PendResult {
         replies: Vec<ReplyEntry>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -352,6 +357,19 @@ mod tests {
         assert!(json.contains("\"ok\":true"));
         assert!(json.contains("\"type\":\"ping_result\""));
         assert!(json.contains("\"online\":true"));
+    }
+
+    #[test]
+    fn test_serialize_ask_skipped_response() {
+        let resp = BusResponse::ok(BusResponseData::AskSkipped {
+            req_id: "r-self".to_string(),
+            provider: "claude".to_string(),
+            reason: "self_request_skipped".to_string(),
+        });
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"ok\":true"));
+        assert!(json.contains("\"type\":\"ask_skipped\""));
+        assert!(json.contains("\"reason\":\"self_request_skipped\""));
     }
 
     #[test]

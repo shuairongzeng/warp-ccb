@@ -33,7 +33,7 @@ use crate::terminal::cli_agent_sessions::listener::is_agent_supported;
 use crate::terminal::cli_agent_sessions::CLIAgentSessionsModel;
 use crate::terminal::view::TerminalView;
 
-const CCB_OUTPUT_SETTLE_DELAY_MS: u64 = 500;
+const CCB_OUTPUT_SETTLE_DELAY_MS: u64 = 1000;
 
 /// Events emitted by LocalAgentBusModel.
 #[derive(Debug, Clone)]
@@ -206,6 +206,19 @@ impl LocalAgentBusModel {
     ) {
         for req_id in self.completion.pending_for_terminal(view_id) {
             if self.completion.check_done_marker(&req_id, output) {
+                if !self.completion.is_output_length_stable(
+                    &req_id,
+                    output,
+                    std::time::Duration::from_millis(CCB_OUTPUT_SETTLE_DELAY_MS),
+                ) {
+                    log::info!(
+                        "CCB诊断: block_completed 检测到完成标记但输出长度尚未稳定，延迟确认 req_id={} output_len={}",
+                        req_id,
+                        output.len()
+                    );
+                    continue;
+                }
+
                 log::info!("LocalAgentBus: CCB_DONE detected for req {}", req_id);
                 let reply = extract_reply(&req_id, output);
                 let will_finalize = !reply.trim().is_empty();
@@ -331,19 +344,16 @@ impl LocalAgentBusModel {
                         !completion::find_unwrapped_ccb_tag_ranges(&output, "CCB_END", marker_id)
                             .is_empty()
                     });
-                    let has_terminal_end = marker_ids.iter().any(|marker_id| {
-                        completion::find_terminal_unwrapped_ccb_tag_range(
-                            &output, "CCB_END", marker_id,
-                        )
-                        .is_some()
+                    let has_reply_closure = marker_ids.iter().any(|marker_id| {
+                        completion::find_last_complete_reply_span(&output, marker_id).is_some()
                     });
                     log::info!(
-                        "CCB_SCAN_TICK: req={}, output_len={}, has_start={}, has_end={}, has_terminal_end={}",
+                        "CCB_SCAN_TICK: req={}, output_len={}, has_start={}, has_end={}, has_reply_closure={}",
                         req_id,
                         output.len(),
                         has_start,
                         has_end,
-                        has_terminal_end,
+                        has_reply_closure,
                     );
                     // Write unconditional debug file (overwritten each tick)
                     let tick_debug = std::env::temp_dir().join(format!("ccb_tick_{}.txt", req_id));
@@ -355,11 +365,11 @@ impl LocalAgentBusModel {
                     let _ = std::fs::write(
                         &tick_debug,
                         format!(
-                            "LEN={}\nHAS_START={}\nHAS_END={}\nHAS_TERMINAL_END={}\n---\n{}\n---",
+                            "LEN={}\nHAS_START={}\nHAS_END={}\nHAS_REPLY_CLOSURE={}\n---\n{}\n---",
                             output.len(),
                             has_start,
                             has_end,
-                            has_terminal_end,
+                            has_reply_closure,
                             debug_output
                         ),
                     );
@@ -560,30 +570,47 @@ impl LocalAgentBusModel {
             None => return None,
         };
 
-        let result = handle.update(ctx, |view, _| {
+        let output: Option<String> = handle.update(ctx, |view, _| {
             let model = view.model.lock();
             let block = model.block_list().active_block();
             // Read all rows (None) to ensure START marker hasn't scrolled out of window.
             let output = block.output_grid().contents_to_string(false, None);
 
-            // Debug: write terminal output to file for diagnosis
-            let debug_path = std::env::temp_dir().join(format!("ccb_capture_{}.txt", req_id));
-            let _ = std::fs::write(&debug_path, &output);
-            log::info!(
-                "CCB_DEBUG: wrote {} chars to {:?}",
-                output.len(),
-                debug_path
-            );
-
-            let reply = extract_reply(req_id, &output);
-            if !reply.is_empty() {
-                return Some(reply);
-            }
-
-            None
+            Some(output)
         });
 
-        result
+        let Some(output) = output else {
+            return None;
+        };
+
+        // Debug: write terminal output to file for diagnosis
+        let debug_path = std::env::temp_dir().join(format!("ccb_capture_{}.txt", req_id));
+        let _ = std::fs::write(&debug_path, &output);
+        log::info!(
+            "CCB_DEBUG: wrote {} chars to {:?}",
+            output.len(),
+            debug_path
+        );
+
+        if !self.completion.is_output_length_stable(
+            req_id,
+            &output,
+            std::time::Duration::from_millis(CCB_OUTPUT_SETTLE_DELAY_MS),
+        ) {
+            log::info!(
+                "CCB诊断: session_completion 检测到完成状态但输出长度尚未稳定，延迟捕获 req_id={} output_len={}",
+                req_id,
+                output.len()
+            );
+            return None;
+        }
+
+        let reply = extract_reply(req_id, &output);
+        if !reply.is_empty() {
+            return Some(reply);
+        }
+
+        None
     }
 
     fn finalize_request_with_reply(
@@ -727,6 +754,22 @@ impl LocalAgentBusModel {
                 provider, sessions
             )),
             FindSessionResult::Found(entity_id) => {
+                if Self::is_self_ask(&provider, &caller, caller_terminal_view_id, entity_id) {
+                    log::info!(
+                        "CCB路由: 跳过 self-ask req_id={} provider={} caller={} caller_pane={:?} target_pane={}",
+                        req_id,
+                        provider,
+                        caller,
+                        caller_terminal_view_id,
+                        entity_id
+                    );
+                    return BusResponse::ok(BusResponseData::AskSkipped {
+                        req_id,
+                        provider,
+                        reason: "self_request_skipped".to_string(),
+                    });
+                }
+
                 if self.registry.has_active_for_terminal(entity_id) {
                     if queue {
                         let now_ms = std::time::SystemTime::now()
@@ -1143,13 +1186,35 @@ impl LocalAgentBusModel {
     /// Extract callback_provider from caller field.
     /// Returns Some(caller) if caller is a known provider name and different from the target provider.
     fn extract_callback(caller: &str, provider: &str) -> Option<String> {
-        let known_providers = [
-            "claude", "codex", "gemini", "opencode", "droid", "kimi", "goose",
-        ];
-        if known_providers.contains(&caller) && caller != provider {
-            Some(caller.to_string())
+        let caller_provider = normalize_provider_name(caller)?;
+        let target_provider = normalize_provider_name(provider)?;
+        if caller_provider != target_provider {
+            Some(caller_provider)
         } else {
             None
+        }
+    }
+
+    fn is_self_ask(
+        provider: &str,
+        caller: &str,
+        caller_terminal_view_id: Option<EntityId>,
+        target_terminal_view_id: EntityId,
+    ) -> bool {
+        if caller_terminal_view_id == Some(target_terminal_view_id) {
+            return true;
+        }
+
+        if caller_terminal_view_id.is_some() {
+            return false;
+        }
+
+        match (
+            normalize_provider_name(caller),
+            normalize_provider_name(provider),
+        ) {
+            (Some(caller_provider), Some(target_provider)) => caller_provider == target_provider,
+            _ => false,
         }
     }
 
@@ -2003,7 +2068,7 @@ impl LocalAgentBusModel {
 
 /// Resolve a provider name string to a CLIAgent enum variant.
 fn resolve_agent(provider: &str) -> Option<CLIAgent> {
-    match provider.to_lowercase().as_str() {
+    match normalize_provider_name(provider)?.as_str() {
         "claude" => Some(CLIAgent::Claude),
         "codex" => Some(CLIAgent::Codex),
         "gemini" => Some(CLIAgent::Gemini),
@@ -2013,6 +2078,22 @@ fn resolve_agent(provider: &str) -> Option<CLIAgent> {
         "amp" => Some(CLIAgent::Amp),
         "kimi" => Some(CLIAgent::Kimi),
         "goose" => Some(CLIAgent::Goose),
+        _ => None,
+    }
+}
+
+fn normalize_provider_name(value: &str) -> Option<String> {
+    let name = value
+        .trim()
+        .split(|ch| ch == '#' || ch == '@' || ch == ':')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+
+    match name.as_str() {
+        "claude" | "codex" | "gemini" | "opencode" | "droid" | "kimi" | "goose" | "copilot"
+        | "amp" => Some(name),
         _ => None,
     }
 }
@@ -2282,42 +2363,27 @@ fn extract_reply(req_id: &str, output: &str) -> String {
         end_tag
     );
 
-    // Strategy 0: 只接受最后一个有效 END 闭环。流式输出中，模型可能先在思考文本里
-    // 复述 marker；如果 END 后面还有真实内容，说明这不是最终回复。
+    // Strategy 0: 取最后一个有效 START/END 闭环。流式输出中，提示词和思考文本
+    // 都可能复述 marker，必须枚举所有候选区间，不能命中第一个就结束。
     let mut saw_new_end_marker = false;
+    let mut saw_new_start_marker = false;
     for marker_id in &marker_ids {
+        if !completion::find_unwrapped_ccb_tag_ranges(output, "CCB_START", marker_id).is_empty() {
+            saw_new_start_marker = true;
+        }
+
         let end_ranges = completion::find_unwrapped_ccb_tag_ranges(output, "CCB_END", marker_id);
         if !end_ranges.is_empty() {
             saw_new_end_marker = true;
         }
-        let Some((end_pos, end_after)) = end_ranges.last().copied() else {
-            continue;
-        };
-        if completion::has_meaningful_content_after(output, end_after) {
-            log::info!(
-                "CCB_DEBUG: latest end marker has meaningful trailing content, waiting marker_id={} end_after={}",
-                marker_id,
-                end_after
-            );
-            continue;
-        }
 
-        let start_ranges =
-            completion::find_unwrapped_ccb_tag_ranges(output, "CCB_START", marker_id);
-        if let Some((_, content_start)) = start_ranges
-            .iter()
-            .rev()
-            .copied()
-            .find(|(_, content_start)| *content_start <= end_pos)
+        if let Some((content_start, end_pos)) =
+            completion::find_last_complete_reply_span(output, marker_id)
         {
             let reply = output[content_start..end_pos].trim();
-            if !reply.is_empty()
-                && !reply.contains("on its own line")
-                && !reply.contains("without backticks")
-                && !reply.contains("<your reply>")
-            {
+            if completion::is_valid_reply_content(reply) {
                 log::info!(
-                    "CCB_DEBUG: terminal tag scan extracted reply_len={} marker_id={}",
+                    "CCB_DEBUG: complete tag scan extracted reply_len={} marker_id={}",
                     reply.len(),
                     marker_id
                 );
@@ -2325,8 +2391,8 @@ fn extract_reply(req_id: &str, output: &str) -> String {
             }
         }
     }
-    if saw_new_end_marker {
-        log::info!("CCB_DEBUG: saw CCB_END marker but no terminal reply closure yet");
+    if saw_new_end_marker && saw_new_start_marker {
+        log::info!("CCB_DEBUG: saw CCB markers but no valid reply closure yet");
         return String::new();
     }
 
@@ -2762,6 +2828,93 @@ GLM-5.1 [GLM Coding Plan China] - Openai […]
         assert!(reply.contains("架构协作者"), "got: {:?}", reply);
         assert!(!reply.contains("Explain this codebase"), "got: {:?}", reply);
         assert!(!reply.contains("gpt-5.5 xhigh"), "got: {:?}", reply);
+    }
+
+    #[test]
+    fn test_extract_reply_uses_last_valid_reply_closure() {
+        let req_id = "20260515-225555-979c6156";
+        let output = "\
+[CCB_REQ_ID:20260515-225555-979c6156]
+介绍一下自己
+Reply using exactly this format. Put the markers on their own lines and do not wrap them in backticks:
+[CCB_START:reply-20260515-225555-979c6156]
+<your reply>
+[CCB_END:reply-20260515-225555-979c6156]
+• 用户要求我介绍自己，并使用特定的格式回复。格式要求：
+  1. 使用 [CCB_START:reply-20260515-225555-979c6156] 标记开始
+  2. 使用 [CCB_END:reply-20260515-225555-979c6156] 标记结束
+• [CCB_START:reply-20260515-225555-979c6156]
+你好！我是 Kimi Code CLI，一个由月之暗面开发的交互式 AI 代理。
+[CCB_END:reply-20260515-225555-979c6156]
+后面出现新的交互提示或任意终端内容";
+
+        let reply = extract_reply(req_id, output);
+        assert!(
+            reply.contains("你好！我是 Kimi Code CLI"),
+            "应提取最后一个真实回复闭环，got: {:?}",
+            reply
+        );
+        assert!(!reply.contains("<your reply>"), "got: {:?}", reply);
+        assert!(!reply.contains("标记开始"), "got: {:?}", reply);
+        assert!(!reply.contains("交互提示"), "got: {:?}", reply);
+    }
+
+    #[test]
+    fn test_extract_reply_allows_truncated_grid_end_prefix() {
+        let req_id = "20260516-001753-d6940bd4";
+        let output = "\
+[CCB_REQ_ID:20260516-001753-d6940bd4]
+Reply using exactly this format. Put the markers on their own lines and do not wrap them in backticks:
+[CCB_START:reply-20260516-001753-d6940bd4]
+<your reply>
+[CCB_END:reply-20260516-001753-d6940bd4]
+
+• [CCB_START:reply-20260516-001753-d6940bd4
+  ]
+  1. 容错与恢复：保障多智能体协作的可靠性。
+  2. 智能路由：降低耦合并提升系统扩展性。
+  3. 全链路可观测：缩短跨 Agent 故障定位时间。
+     B_END:reply-20260516-001753-d6940bd4]
+
+── input ─────────────────────────────────
+yolo  agent (Kimi-k2.6 ●)  D:\\GitHub\\warp-ccb";
+
+        let reply = extract_reply(req_id, output);
+        assert!(reply.contains("容错与恢复"), "got: {:?}", reply);
+        assert!(reply.contains("智能路由"), "got: {:?}", reply);
+        assert!(reply.contains("全链路可观测"), "got: {:?}", reply);
+        assert!(!reply.contains("<your reply>"), "got: {:?}", reply);
+        assert!(!reply.contains("yolo  agent"), "got: {:?}", reply);
+    }
+
+    #[test]
+    fn test_self_ask_detects_same_terminal() {
+        assert!(LocalAgentBusModel::is_self_ask(
+            "codex",
+            "claude",
+            Some(EntityId::from_usize(42)),
+            EntityId::from_usize(42)
+        ));
+    }
+
+    #[test]
+    fn test_self_ask_detects_same_provider_without_terminal_id() {
+        assert!(LocalAgentBusModel::is_self_ask(
+            "claude",
+            "claude",
+            None,
+            EntityId::from_usize(42)
+        ));
+    }
+
+    #[test]
+    fn test_self_ask_allows_same_provider_different_terminal_id() {
+        assert!(!LocalAgentBusModel::is_self_ask(
+            "claude",
+            "claude",
+            Some(EntityId::from_usize(7)),
+            EntityId::from_usize(42)
+        ));
     }
 
     #[test]
