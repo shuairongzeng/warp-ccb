@@ -36,6 +36,7 @@ use crate::terminal::cli_agent_sessions::CLIAgentSessionsModel;
 use crate::terminal::view::TerminalView;
 
 const CCB_OUTPUT_SETTLE_DELAY_MS: u64 = 1000;
+const DEFAULT_BUS_INJECT_ENTER_DELAY_MS: u64 = 1000;
 const EXPLICIT_REPLY_MAX_CONTENT_BYTES: usize = 4 * 1024 * 1024;
 
 /// Events emitted by LocalAgentBusModel.
@@ -957,7 +958,8 @@ impl LocalAgentBusModel {
         );
         self.raw_output_capture
             .register_request(req_id.clone(), entity_id);
-        let injected = self.inject_prompt(entity_id, &wrapped_prompt, ctx);
+        let injected =
+            self.inject_prompt(entity_id, &provider, Some(&req_id), &wrapped_prompt, ctx);
 
         if injected {
             self.registry.update_status(&req_id, RequestStatus::Running);
@@ -1391,7 +1393,13 @@ impl LocalAgentBusModel {
 
         // Use inject_prompt (same as ask) so the callback is treated as user input
         // and processed by the CLI agent naturally.
-        let injected = self.inject_prompt(callback_entity_id, &callback_msg, ctx);
+        let injected = self.inject_prompt(
+            callback_entity_id,
+            &callback_provider,
+            Some(&callback_req_id),
+            &callback_msg,
+            ctx,
+        );
         if injected {
             log::info!(
                 "CCB回调: 已注入 req_id={} to={}#{} reply_len={}",
@@ -1448,7 +1456,13 @@ impl LocalAgentBusModel {
             );
             self.raw_output_capture
                 .register_request(queued.req_id.clone(), queued.terminal_view_id);
-            let injected = self.inject_prompt(queued.terminal_view_id, &wrapped_prompt, ctx);
+            let injected = self.inject_prompt(
+                queued.terminal_view_id,
+                &queued.provider,
+                Some(&queued.req_id),
+                &wrapped_prompt,
+                ctx,
+            );
 
             if injected {
                 self.registry
@@ -1750,7 +1764,8 @@ impl LocalAgentBusModel {
         );
         self.raw_output_capture
             .register_request(req_id.clone(), entity_id);
-        let injected = self.inject_prompt(entity_id, &wrapped_prompt, ctx);
+        let injected =
+            self.inject_prompt(entity_id, &provider, Some(&req_id), &wrapped_prompt, ctx);
 
         if injected {
             self.registry.update_status(&req_id, RequestStatus::Running);
@@ -2096,7 +2111,14 @@ impl LocalAgentBusModel {
     }
 
     /// Inject a prompt into a terminal view's PTY using the stored weak handle.
-    fn inject_prompt(&self, view_id: EntityId, prompt: &str, ctx: &mut ModelContext<Self>) -> bool {
+    fn inject_prompt(
+        &self,
+        view_id: EntityId,
+        provider: &str,
+        req_id: Option<&str>,
+        prompt: &str,
+        ctx: &mut ModelContext<Self>,
+    ) -> bool {
         log::info!(
             "LocalAgentBus: inject_prompt for view {:?}, handles count={}",
             view_id,
@@ -2122,35 +2144,88 @@ impl LocalAgentBusModel {
                     prompt.len()
                 );
 
-                // Two-phase injection to work around Codex's paste burst protection:
-                // Phase 1: Send text via bracketed paste
-                // Phase 2: After 200ms delay, send Enter separately
-                //
-                // Codex suppresses Enter within ~120ms of a paste burst on Windows.
-                // By delaying the Enter, it arrives outside the suppression window.
-
-                // Phase 1: bracketed paste text
-                let prompt_bytes = prompt.as_bytes();
-                let mut paste_bytes = Vec::with_capacity(6 + prompt_bytes.len() + 6);
-                paste_bytes.extend_from_slice(b"\x1b[200~");
-                paste_bytes.extend_from_slice(prompt_bytes);
-                paste_bytes.extend_from_slice(b"\x1b[201~");
-
-                let enter_handle = handle.clone();
+                let agent = resolve_agent(provider).unwrap_or(CLIAgent::Unknown);
+                let strategy = bus_prompt_submit_strategy(agent, prompt);
+                let enter_delay_ms = parse_bus_inject_enter_delay_ms(
+                    std::env::var("WARP_CCB_INJECT_ENTER_DELAY_MS")
+                        .ok()
+                        .as_deref(),
+                );
+                let req_label = req_id.unwrap_or("-").to_string();
+                let provider_label = provider.to_string();
+                let prompt_bytes = prompt.as_bytes().to_vec();
                 handle.update(ctx, |view, ctx| {
-                    // Phase 1: send bracketed paste text immediately
-                    view.write_to_pty(paste_bytes, ctx);
-
-                    // Phase 2: send Enter after 200ms delay (outside paste burst window)
-                    ctx.spawn(
-                        Timer::after(std::time::Duration::from_millis(200)),
-                        move |view, _, ctx| {
-                            view.write_to_pty(b"\r", ctx);
-                        },
-                    );
+                    match strategy {
+                        BusPromptSubmitStrategy::Inline => {
+                            let mut bytes = prompt_bytes;
+                            bytes.extend_from_slice(b"\r");
+                            let byte_len = bytes.len();
+                            view.write_to_pty(bytes, ctx);
+                            log::info!(
+                                "CCB注入: inline_sent req_id={} provider={} pane={} bytes={}",
+                                req_label,
+                                provider_label,
+                                view_id,
+                                byte_len
+                            );
+                        }
+                        BusPromptSubmitStrategy::DelayedEnter => {
+                            let byte_len = prompt_bytes.len();
+                            view.write_to_pty(prompt_bytes, ctx);
+                            log::info!(
+                                "CCB注入: text_sent req_id={} provider={} pane={} bytes={} strategy={:?}",
+                                req_label,
+                                provider_label,
+                                view_id,
+                                byte_len,
+                                strategy
+                            );
+                            ctx.spawn(
+                                Timer::after(std::time::Duration::from_millis(enter_delay_ms)),
+                                move |view, _, ctx| {
+                                    view.write_to_pty(b"\r", ctx);
+                                    log::info!(
+                                        "CCB注入: enter_sent req_id={} provider={} pane={} delay_ms={}",
+                                        req_label,
+                                        provider_label,
+                                        view_id,
+                                        enter_delay_ms
+                                    );
+                                },
+                            );
+                        }
+                        BusPromptSubmitStrategy::BracketedPasteDelayedEnter => {
+                            let mut paste_bytes =
+                                Vec::with_capacity(6 + prompt_bytes.len() + 6);
+                            paste_bytes.extend_from_slice(b"\x1b[200~");
+                            paste_bytes.extend_from_slice(&prompt_bytes);
+                            paste_bytes.extend_from_slice(b"\x1b[201~");
+                            let byte_len = paste_bytes.len();
+                            view.write_to_pty(paste_bytes, ctx);
+                            log::info!(
+                                "CCB注入: paste_sent req_id={} provider={} pane={} bytes={} strategy={:?}",
+                                req_label,
+                                provider_label,
+                                view_id,
+                                byte_len,
+                                strategy
+                            );
+                            ctx.spawn(
+                                Timer::after(std::time::Duration::from_millis(enter_delay_ms)),
+                                move |view, _, ctx| {
+                                    view.write_to_pty(b"\r", ctx);
+                                    log::info!(
+                                        "CCB注入: enter_sent req_id={} provider={} pane={} delay_ms={}",
+                                        req_label,
+                                        provider_label,
+                                        view_id,
+                                        enter_delay_ms
+                                    );
+                                },
+                            );
+                        }
+                    }
                 });
-
-                let _ = enter_handle; // moved into spawn closure above
                 true
             }
             None => {
@@ -2314,6 +2389,43 @@ fn validate_explicit_reply(
 
 fn active_block_blocks_bus_launch(started: bool, finished: bool) -> bool {
     started && !finished
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BusPromptSubmitStrategy {
+    Inline,
+    DelayedEnter,
+    BracketedPasteDelayedEnter,
+}
+
+fn bus_prompt_submit_strategy(agent: CLIAgent, prompt: &str) -> BusPromptSubmitStrategy {
+    // CCB 任务是多行协议包时必须用 bracketed paste，否则换行可能被 CLI 当成提交键。
+    if prompt.contains('\n') || prompt.contains('\r') {
+        return BusPromptSubmitStrategy::BracketedPasteDelayedEnter;
+    }
+
+    match agent {
+        CLIAgent::Codex | CLIAgent::Copilot => BusPromptSubmitStrategy::BracketedPasteDelayedEnter,
+        CLIAgent::Claude
+        | CLIAgent::Gemini
+        | CLIAgent::OpenCode
+        | CLIAgent::Auggie
+        | CLIAgent::CursorCli => BusPromptSubmitStrategy::DelayedEnter,
+        CLIAgent::Amp
+        | CLIAgent::Droid
+        | CLIAgent::Pi
+        | CLIAgent::Goose
+        | CLIAgent::Hermes
+        | CLIAgent::Vibe
+        | CLIAgent::Kimi
+        | CLIAgent::Unknown => BusPromptSubmitStrategy::Inline,
+    }
+}
+
+fn parse_bus_inject_enter_delay_ms(raw_value: Option<&str>) -> u64 {
+    raw_value
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_BUS_INJECT_ENTER_DELAY_MS)
 }
 
 fn detect_bus_agent_from_terminal_output(output: &str) -> Option<CLIAgent> {
@@ -3381,6 +3493,46 @@ yolo  agent (Kimi-k2.6 ●)  D:\\GitHub\\warp-ccb";
         assert!(active_block_blocks_bus_launch(true, false));
         assert!(!active_block_blocks_bus_launch(false, false));
         assert!(!active_block_blocks_bus_launch(true, true));
+    }
+
+    #[test]
+    fn test_bus_prompt_submit_strategy_is_provider_specific() {
+        assert_eq!(
+            bus_prompt_submit_strategy(CLIAgent::Kimi, "hello"),
+            BusPromptSubmitStrategy::Inline
+        );
+        assert_eq!(
+            bus_prompt_submit_strategy(CLIAgent::Droid, "hello"),
+            BusPromptSubmitStrategy::Inline
+        );
+        assert_eq!(
+            bus_prompt_submit_strategy(CLIAgent::Claude, "hello"),
+            BusPromptSubmitStrategy::DelayedEnter
+        );
+        assert_eq!(
+            bus_prompt_submit_strategy(CLIAgent::Codex, "hello"),
+            BusPromptSubmitStrategy::BracketedPasteDelayedEnter
+        );
+    }
+
+    #[test]
+    fn test_bus_prompt_submit_strategy_uses_bracketed_paste_for_multiline_prompt() {
+        assert_eq!(
+            bus_prompt_submit_strategy(CLIAgent::Kimi, "line 1\nline 2"),
+            BusPromptSubmitStrategy::BracketedPasteDelayedEnter
+        );
+        assert_eq!(
+            bus_prompt_submit_strategy(CLIAgent::Droid, "line 1\nline 2"),
+            BusPromptSubmitStrategy::BracketedPasteDelayedEnter
+        );
+    }
+
+    #[test]
+    fn test_parse_bus_inject_enter_delay_ms() {
+        assert_eq!(parse_bus_inject_enter_delay_ms(None), 1000);
+        assert_eq!(parse_bus_inject_enter_delay_ms(Some("1500")), 1500);
+        assert_eq!(parse_bus_inject_enter_delay_ms(Some("0")), 0);
+        assert_eq!(parse_bus_inject_enter_delay_ms(Some("bad")), 1000);
     }
 
     #[test]
