@@ -266,7 +266,10 @@ impl LocalAgentBusModel {
                 );
                 continue;
             }
-            self.finalize_request_with_reply(&req_id, selected.reply, selected.source, ctx);
+            let source = selected.source;
+            let reply = selected.reply;
+            let meta = ReplyCaptureMeta::from_source_and_reply(source, &reply);
+            self.finalize_request_with_reply(&req_id, reply, meta, ctx);
         }
     }
 
@@ -349,7 +352,7 @@ impl LocalAgentBusModel {
                 Some(block.output_grid().contents_to_string(false, None))
             });
 
-            if let Some(grid_output) = output {
+            if let Some(ref grid_output) = output {
                 for req_id in &req_ids {
                     let raw_output = self.raw_output_capture.snapshot(req_id);
                     log_scan_tick_diagnostics(req_id, raw_output.as_deref(), Some(&grid_output));
@@ -417,7 +420,87 @@ impl LocalAgentBusModel {
                         );
                         continue;
                     }
-                    self.finalize_request_with_reply(req_id, selected.reply, selected.source, ctx);
+                    let source = selected.source;
+                    let reply = selected.reply;
+                    let meta = ReplyCaptureMeta::from_source_and_reply(source, &reply);
+                    self.finalize_request_with_reply(req_id, reply, meta, ctx);
+                }
+            }
+
+            // Passive capture fallback: for requests where no markers were found,
+            // check if raw output has stabilized long enough to treat as a reply.
+            {
+                for req_id in &req_ids {
+                    // Skip if already finalized (marker scan succeeded).
+                    if self
+                        .registry
+                        .get(req_id)
+                        .map_or(true, |e| e.status != RequestStatus::Running)
+                    {
+                        continue;
+                    }
+
+                    let raw_output = self.raw_output_capture.snapshot(req_id);
+                    if raw_output.as_ref().map_or(true, |s| s.is_empty()) {
+                        continue;
+                    }
+
+                    // Adaptive completion: use CompletionTracker to decide whether
+                    // the output has been stable long enough, based on session type.
+                    let stable_duration = self
+                        .completion
+                        .output_stable_duration(req_id, raw_output.as_deref().unwrap_or(""));
+                    let Some(stable_for) = stable_duration else {
+                        continue;
+                    };
+
+                    if !self.completion.should_finalize_passive(req_id, stable_for) {
+                        continue;
+                    }
+
+                    // Look up provider for provider-specific cleaning.
+                    let provider = self
+                        .registry
+                        .get(req_id)
+                        .map(|e| e.provider.clone())
+                        .unwrap_or_default();
+
+                    let grid_snap: Option<&str> = None; // Grid output was already tried above; raw is preferred for passive.
+                    let candidate = build_passive_candidate(
+                        req_id,
+                        raw_output.as_deref(),
+                        grid_snap.as_deref(),
+                        &provider,
+                    );
+                    let Some((reply, meta)) = candidate else {
+                        continue;
+                    };
+
+                    log::info!(
+                        "CCB_PASSIVE: finalizing passive capture req_id={} source={:?} confidence={} reply_len={} stable_for={:?}",
+                        req_id,
+                        meta.source,
+                        meta.confidence,
+                        reply.len(),
+                        stable_for,
+                    );
+                    let debug_path =
+                        std::env::temp_dir().join(format!("ccb_passive_{}.txt", req_id));
+                    let raw_snap = raw_output.unwrap_or_default();
+                    let _ = std::fs::write(
+                        &debug_path,
+                        format!(
+                            "SOURCE={:?}\nCONFIDENCE={}\nRAW_LEN={}\nFILTERED_LEN={}\nWARNINGS={:?}\n---RAW---\n{}\n---REPLY---\n{}\n---END---",
+                            meta.source,
+                            meta.confidence,
+                            meta.raw_len,
+                            meta.filtered_len,
+                            meta.warnings,
+                            &raw_snap[..raw_snap.len().min(2000)],
+                            reply,
+                        ),
+                    );
+                    self.finalize_request_with_reply(req_id, reply, meta, ctx);
                 }
             }
         }
@@ -505,7 +588,8 @@ impl LocalAgentBusModel {
                 );
                 continue;
             }
-            self.finalize_request_with_reply(&req_id, reply_text, capture_source, ctx);
+            let meta = ReplyCaptureMeta::from_source_and_reply(capture_source, &reply_text);
+            self.finalize_request_with_reply(&req_id, reply_text, meta, ctx);
         }
         for req_id in errored {
             self.registry.update_status(&req_id, RequestStatus::Error);
@@ -615,7 +699,7 @@ impl LocalAgentBusModel {
     ) -> bool {
         let stable_for = std::time::Duration::from_millis(CCB_OUTPUT_SETTLE_DELAY_MS);
         let stable = match source {
-            CaptureSource::RawOutputScan => self
+            CaptureSource::RawOutputScan | CaptureSource::PassiveRawOutput => self
                 .raw_output_capture
                 .is_request_stable(req_id, stable_for),
             _ => self
@@ -640,14 +724,14 @@ impl LocalAgentBusModel {
         &mut self,
         req_id: &str,
         reply: String,
-        source: CaptureSource,
+        meta: ReplyCaptureMeta,
         ctx: &mut ModelContext<Self>,
     ) -> bool {
         if reply.trim().is_empty() {
             log::error!(
                 "CCB诊断: 拒绝将空回复标记为 Success req_id={} source={:?}",
                 req_id,
-                source
+                meta.source
             );
             return false;
         }
@@ -667,9 +751,10 @@ impl LocalAgentBusModel {
             };
 
         log::info!(
-            "CCB路由: 完成请求 req_id={} source={:?} from={}#{} callback={:?}#{:?} reply_len={}",
+            "CCB路由: 完成请求 req_id={} source={:?} confidence={} from={}#{} callback={:?}#{:?} reply_len={}",
             req_id,
-            source,
+            meta.source,
+            meta.confidence,
             from_provider,
             receiver_terminal_view_id,
             callback_provider,
@@ -677,9 +762,20 @@ impl LocalAgentBusModel {
             reply.len()
         );
 
+        let finalized_at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+
         self.registry.set_reply_content(req_id, reply.clone());
+        self.registry.set_reply_metadata(
+            req_id,
+            Some(meta.source.to_string()),
+            Some(meta.confidence),
+            meta.warnings.clone(),
+        );
         self.registry.update_status(req_id, RequestStatus::Success);
-        self.persist_response(req_id);
+        self.persist_response(req_id, &meta, finalized_at_ms);
         self.completion.deregister(req_id);
         self.raw_output_capture.deregister_request(req_id);
         self.notify_waiters(req_id);
@@ -783,7 +879,8 @@ impl LocalAgentBusModel {
             Err(message) => return BusResponse::error(message),
         }
 
-        self.finalize_request_with_reply(&req_id, content, CaptureSource::ExplicitReply, ctx);
+        let meta = ReplyCaptureMeta::from_source_and_reply(CaptureSource::ExplicitReply, &content);
+        self.finalize_request_with_reply(&req_id, content, meta, ctx);
         self.process_queued_requests(ctx);
 
         BusResponse::ok(BusResponseData::ReplyAccepted {
@@ -857,6 +954,9 @@ impl LocalAgentBusModel {
                             updated_at_ms: now_ms,
                             error_message: None,
                             reply_content: None,
+                            reply_source: None,
+                            reply_confidence: None,
+                            reply_warnings: Vec::new(),
                             callback_provider,
                             caller_terminal_view_id,
                             caller_session_id,
@@ -945,6 +1045,9 @@ impl LocalAgentBusModel {
             updated_at_ms: now_ms,
             error_message: None,
             reply_content: None,
+            reply_source: None,
+            reply_confidence: None,
+            reply_warnings: Vec::new(),
             callback_provider,
             caller_terminal_view_id,
             caller_session_id,
@@ -965,6 +1068,14 @@ impl LocalAgentBusModel {
             self.registry.update_status(&req_id, RequestStatus::Running);
             self.completion
                 .register(req_id.clone(), provider.clone(), entity_id);
+            {
+                let sessions_model = CLIAgentSessionsModel::as_ref(ctx);
+                let has_session_listener = sessions_model.session(entity_id).is_some();
+                self.completion
+                    .set_has_session_listener(&req_id, has_session_listener);
+                let agent = resolve_agent(&provider).unwrap_or(CLIAgent::Unknown);
+                self.completion.set_provider_agent(&req_id, agent);
+            }
         } else {
             self.registry.update_status(&req_id, RequestStatus::Error);
             self.raw_output_capture.deregister_request(&req_id);
@@ -998,7 +1109,11 @@ impl LocalAgentBusModel {
 
         // Backfill empty reply_content from persistent store
         for reply in &mut replies {
-            if reply.content.is_empty() {
+            if reply.content.is_empty()
+                || reply.source.is_none()
+                || reply.confidence.is_none()
+                || reply.warnings.is_empty()
+            {
                 if let Ok(stored) = self.store.read(&reply.req_id) {
                     if !stored.content.is_empty() {
                         log::info!(
@@ -1006,6 +1121,15 @@ impl LocalAgentBusModel {
                             reply.req_id, stored.content.len()
                         );
                         reply.content = stored.content;
+                    }
+                    if reply.source.is_none() {
+                        reply.source = stored.source;
+                    }
+                    if reply.confidence.is_none() {
+                        reply.confidence = stored.confidence;
+                    }
+                    if reply.warnings.is_empty() {
+                        reply.warnings = stored.warnings;
                     }
                 }
             }
@@ -1187,6 +1311,9 @@ impl LocalAgentBusModel {
                         .or_else(|| entry.error_message.clone())
                         .unwrap_or_default(),
                     elapsed_ms: now_ms.saturating_sub(entry.created_at_ms),
+                    source: entry.reply_source.clone(),
+                    confidence: entry.reply_confidence,
+                    warnings: entry.reply_warnings.clone(),
                 });
                 let _ = reply_tx.send(response);
                 return;
@@ -1224,6 +1351,9 @@ impl LocalAgentBusModel {
                     .or_else(|| entry.error_message.clone())
                     .unwrap_or_default(),
                 elapsed_ms: now_ms.saturating_sub(entry.created_at_ms),
+                source: entry.reply_source.clone(),
+                confidence: entry.reply_confidence,
+                warnings: entry.reply_warnings.clone(),
             });
             for tx in senders {
                 let _ = tx.send(response.clone());
@@ -1233,7 +1363,7 @@ impl LocalAgentBusModel {
 
     /// Persist a completed response to the file-based ResponseStore.
     /// This ensures reply content survives crashes and is available via warp-pend.
-    fn persist_response(&self, req_id: &str) {
+    fn persist_response(&self, req_id: &str, meta: &ReplyCaptureMeta, finalized_at_ms: u64) {
         if let Some(entry) = self.registry.get(req_id) {
             let now_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1247,6 +1377,13 @@ impl LocalAgentBusModel {
                 created_at_ms: entry.created_at_ms,
                 updated_at_ms: now_ms,
                 schema_version: store::StoredResponse::SCHEMA_VERSION,
+                source: Some(meta.source.to_string()),
+                confidence: Some(meta.confidence),
+                warnings: meta.warnings.clone(),
+                raw_len: Some(meta.raw_len),
+                filtered_len: Some(meta.filtered_len),
+                truncated: Some(meta.truncated),
+                finalized_at_ms: Some(finalized_at_ms),
             };
             if let Err(e) = self.store.write(&stored) {
                 log::warn!(
@@ -1751,6 +1888,9 @@ impl LocalAgentBusModel {
             updated_at_ms: now_ms,
             error_message: None,
             reply_content: None,
+            reply_source: None,
+            reply_confidence: None,
+            reply_warnings: Vec::new(),
             callback_provider,
             caller_terminal_view_id: None,
             caller_session_id: None,
@@ -1946,6 +2086,9 @@ impl LocalAgentBusModel {
                         updated_at_ms: now_ms,
                         error_message: None,
                         reply_content: None,
+                        reply_source: None,
+                        reply_confidence: None,
+                        reply_warnings: Vec::new(),
                         callback_provider: None,
                         caller_terminal_view_id: None,
                         caller_session_id: None,
@@ -2517,6 +2660,64 @@ enum CaptureSource {
     OutputScan,
     SessionCompletion,
     ExplicitReply,
+    PassiveRawOutput,
+    PassiveGridOutput,
+    PassiveTimeoutPartial,
+}
+
+impl CaptureSource {
+    fn as_str(&self) -> &'static str {
+        match self {
+            CaptureSource::BlockCompleted => "block_completed",
+            CaptureSource::RawOutputScan => "raw_output_scan",
+            CaptureSource::OutputScan => "output_scan",
+            CaptureSource::SessionCompletion => "session_completion",
+            CaptureSource::ExplicitReply => "explicit_reply",
+            CaptureSource::PassiveRawOutput => "passive_raw_output",
+            CaptureSource::PassiveGridOutput => "passive_grid_output",
+            CaptureSource::PassiveTimeoutPartial => "passive_timeout_partial",
+        }
+    }
+
+    fn to_string(&self) -> String {
+        self.as_str().to_string()
+    }
+
+    fn default_confidence(&self) -> f64 {
+        match self {
+            CaptureSource::ExplicitReply => 1.0,
+            CaptureSource::BlockCompleted
+            | CaptureSource::RawOutputScan
+            | CaptureSource::OutputScan
+            | CaptureSource::SessionCompletion => 0.95,
+            CaptureSource::PassiveRawOutput => 0.7,
+            CaptureSource::PassiveGridOutput => 0.55,
+            CaptureSource::PassiveTimeoutPartial => 0.3,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ReplyCaptureMeta {
+    source: CaptureSource,
+    confidence: f64,
+    warnings: Vec<String>,
+    raw_len: usize,
+    filtered_len: usize,
+    truncated: bool,
+}
+
+impl ReplyCaptureMeta {
+    fn from_source_and_reply(source: CaptureSource, reply: &str) -> Self {
+        Self {
+            source,
+            confidence: source.default_confidence(),
+            warnings: Vec::new(),
+            raw_len: reply.len(),
+            filtered_len: reply.len(),
+            truncated: false,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -2619,13 +2820,7 @@ fn write_reply_capture_debug_file(req_id: &str, source: CaptureSource, output: &
 }
 
 fn capture_source_name(source: CaptureSource) -> &'static str {
-    match source {
-        CaptureSource::BlockCompleted => "block_completed",
-        CaptureSource::RawOutputScan => "raw_output_scan",
-        CaptureSource::OutputScan => "output_scan",
-        CaptureSource::SessionCompletion => "session_completion",
-        CaptureSource::ExplicitReply => "explicit_reply",
-    }
+    source.as_str()
 }
 
 fn debug_prefix(input: &str, max_chars: usize) -> String {
@@ -2762,6 +2957,228 @@ fn debug_output_for_tick(output: Option<&str>, diag: &MarkerDiagnostics) -> Stri
     } else {
         debug_prefix(output, 3000)
     }
+}
+
+/// Minimum character count for a passive capture to be considered a valid reply.
+const PASSIVE_CAPTURE_MIN_CHARS: usize = 50;
+
+/// Clean passive-captured raw output into a reply candidate.
+///
+/// Returns (cleaned_content, warnings). Steps:
+/// 1. Strip everything up to and including the [CCB_REQ_ID:xxx] line (prompt echo).
+/// 2. Remove instruction text (warp-reply commands, marker instructions).
+/// 3. Remove leftover [CCB_START:...]/[CCB_END:...] markers that never closed properly.
+/// 4. Compress consecutive blank lines to at most 2.
+/// 5. Remove known provider chrome (Kimi shell tags, Codex status lines, etc.).
+/// 6. Trim leading/trailing whitespace.
+fn clean_passive_output(raw_output: &str, provider: &str) -> (String, Vec<String>) {
+    let mut warnings = Vec::new();
+    let mut text = raw_output;
+
+    // Step 1: Remove prompt echo — everything up to and including [CCB_REQ_ID:xxx] line.
+    if let Some(pos) = text.find("[CCB_REQ_ID:") {
+        // Find end of this line
+        let line_end = text[pos..]
+            .find('\n')
+            .map(|p| pos + p + 1)
+            .unwrap_or(text.len());
+        text = &text[line_end..];
+    }
+
+    // Step 2: Remove instruction text lines.
+    let instruction_patterns = [
+        "After completing this task",
+        "After completing this task, submit your reply using:",
+        "warp-reply --req-id",
+        "If warp-reply is unavailable or fails",
+        "echo \"$CONTENT\" | warp-reply",
+        "--content-file <file>",
+        "--stdin",
+        "put markers on their own lines",
+        "no backticks",
+        "<your reply>",
+    ];
+    let mut lines: Vec<&str> = text.lines().collect();
+    lines.retain(|line| {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            return true; // keep blank lines for now; compress later
+        }
+        for pattern in &instruction_patterns {
+            if trimmed.contains(pattern) {
+                return false;
+            }
+        }
+        true
+    });
+
+    // Step 3: Remove leftover CCB markers that never formed a valid closure.
+    let marker_re = regex_lazy();
+    let filtered_lines: Vec<String> = lines
+        .iter()
+        .map(|l| marker_re.replace_all(l, "").to_string())
+        .collect();
+
+    // Step 4: Compress consecutive blank lines to at most 2.
+    let mut compressed = String::new();
+    let mut consecutive_blank = 0usize;
+    for line in &filtered_lines {
+        if line.trim().is_empty() {
+            consecutive_blank += 1;
+            if consecutive_blank <= 2 {
+                compressed.push('\n');
+            }
+        } else {
+            consecutive_blank = 0;
+            compressed.push_str(line);
+            compressed.push('\n');
+        }
+    }
+
+    // Step 5: Remove known provider chrome.
+    let provider_lower = provider.to_ascii_lowercase();
+    let cleaned = match provider_lower.as_str() {
+        "kimi" => clean_kimi_chrome(&compressed, &mut warnings),
+        "codex" => clean_codex_chrome(&compressed),
+        "droid" => clean_droid_chrome(&compressed),
+        _ => compressed,
+    };
+
+    // Step 6: Trim.
+    let result = cleaned.trim().to_string();
+
+    // Warn if result seems to contain thinking/intermediate output.
+    if result.contains("让我思考") || result.contains("让我分析") || result.contains("Let me think")
+    {
+        warnings.push("passive_capture_contains_thinking".to_string());
+    }
+
+    (result, warnings)
+}
+
+fn regex_lazy() -> regex::Regex {
+    use std::sync::OnceLock;
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        regex::Regex::new(
+            r"\[CCB_START:reply-[^\]]*\]|\[CCB_END:reply-[^\]]*\]|\[CCB_DONE:[^\]]*\]",
+        )
+        .unwrap()
+    })
+    .clone()
+}
+
+/// Remove Kimi-specific chrome: function call markers like functions.Shell:N, <system>...</system> tags.
+fn clean_kimi_chrome(text: &str, warnings: &mut Vec<String>) -> String {
+    let re = regex::Regex::new(r"functions\.\w+:\d+").unwrap();
+    let mut result = re.replace_all(text, "").to_string();
+
+    // Remove <system>...</system> blocks.
+    let sys_re = regex::Regex::new(r"(?s)<system>.*?</system>").unwrap();
+    if sys_re.is_match(&result) {
+        warnings.push("passive_capture_contains_system_tags".to_string());
+    }
+    result = sys_re.replace_all(&result, "").to_string();
+
+    // Remove lines that are just standalone markers like ╭─...╮ boxes from Kimi UI.
+    let mut cleaned_lines = Vec::new();
+    for line in result.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('╭') || trimmed.starts_with('╰') || trimmed.starts_with('│') {
+            continue;
+        }
+        cleaned_lines.push(line);
+    }
+    cleaned_lines.join("\n")
+}
+
+/// Remove Codex-specific chrome: status/reasoning lines starting with ›.
+fn clean_codex_chrome(text: &str) -> String {
+    text.lines()
+        .filter(|line| !line.trim().starts_with('›'))
+        .collect::<Vec<&str>>()
+        .join("\n")
+}
+
+/// Droid-specific chrome removal. Currently a no-op; add patterns as needed.
+fn clean_droid_chrome(text: &str) -> String {
+    text.to_string()
+}
+
+/// Build a passive capture candidate from raw/grid output when all marker strategies failed.
+///
+/// Returns a `ReplyCaptureMeta` if the cleaned output is substantial enough (>= PASSIVE_CAPTURE_MIN_CHARS).
+fn build_passive_candidate(
+    req_id: &str,
+    raw_output: Option<&str>,
+    grid_output: Option<&str>,
+    provider: &str,
+) -> Option<(String, ReplyCaptureMeta)> {
+    // Prefer raw output (higher fidelity) over grid output.
+    if let Some(raw) = raw_output.filter(|s| !s.is_empty()) {
+        let (cleaned, warnings) = clean_passive_output(raw, provider);
+        if cleaned.len() >= PASSIVE_CAPTURE_MIN_CHARS {
+            let raw_len = raw.len();
+            let filtered_len = cleaned.len();
+            log::info!(
+                "CCB_PASSIVE: built PassiveRawOutput candidate req_id={} raw_len={} filtered_len={} warnings={:?}",
+                req_id,
+                raw_len,
+                filtered_len,
+                warnings,
+            );
+            return Some((
+                cleaned,
+                ReplyCaptureMeta {
+                    source: CaptureSource::PassiveRawOutput,
+                    confidence: 0.7,
+                    warnings,
+                    raw_len,
+                    filtered_len,
+                    truncated: false,
+                },
+            ));
+        }
+        log::info!(
+            "CCB_PASSIVE: raw output too short after cleaning ({} chars), trying grid req_id={}",
+            cleaned.len(),
+            req_id,
+        );
+    }
+
+    // Fallback to grid output.
+    if let Some(grid) = grid_output.filter(|s| !s.is_empty()) {
+        let (cleaned, warnings) = clean_passive_output(grid, provider);
+        if cleaned.len() >= PASSIVE_CAPTURE_MIN_CHARS {
+            let raw_len = grid.len();
+            let filtered_len = cleaned.len();
+            log::info!(
+                "CCB_PASSIVE: built PassiveGridOutput candidate req_id={} raw_len={} filtered_len={} warnings={:?}",
+                req_id,
+                raw_len,
+                filtered_len,
+                warnings,
+            );
+            return Some((
+                cleaned,
+                ReplyCaptureMeta {
+                    source: CaptureSource::PassiveGridOutput,
+                    confidence: 0.55,
+                    warnings,
+                    raw_len,
+                    filtered_len,
+                    truncated: false,
+                },
+            ));
+        }
+        log::info!(
+            "CCB_PASSIVE: grid output also too short after cleaning ({} chars) req_id={}",
+            cleaned.len(),
+            req_id,
+        );
+    }
+
+    None
 }
 
 /// Extract reply content from terminal output.
@@ -2998,6 +3415,7 @@ fn extract_reply(req_id: &str, output: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn test_extract_reply_new_format() {
@@ -3033,6 +3451,104 @@ mod tests {
         let output = "some random output without markers";
         let reply = extract_reply("abc", output);
         assert_eq!(reply, "");
+    }
+
+    #[test]
+    fn test_clean_passive_output_removes_instruction_echo() {
+        let raw = "some prompt text\n[CCB_REQ_ID:abc-123]\nHello this is my reply\nAfter completing this task...\nwarp-reply --req-id";
+        let (cleaned, _warnings) = clean_passive_output(raw, "kimi");
+        assert!(cleaned.contains("Hello this is my reply"));
+        assert!(!cleaned.contains("CCB_REQ_ID"));
+        assert!(!cleaned.contains("warp-reply"));
+        assert!(!cleaned.contains("After completing"));
+    }
+
+    #[test]
+    fn test_clean_passive_output_preserves_valid_content() {
+        let raw = "[CCB_REQ_ID:abc]\n这是我的详细回复，包含代码和解释。这是一段很长的内容。";
+        let (cleaned, _warnings) = clean_passive_output(raw, "kimi");
+        assert!(cleaned.contains("这是我的详细回复"));
+    }
+
+    #[test]
+    fn test_clean_passive_output_removes_kimi_chrome() {
+        let raw = "[CCB_REQ_ID:x]\nfunctions.Shell:6\n<system>Command executed</system>\nMy actual reply here with enough text to pass threshold";
+        let (cleaned, _warnings) = clean_passive_output(raw, "kimi");
+        assert!(!cleaned.contains("functions.Shell"));
+        assert!(!cleaned.contains("<system>"));
+        assert!(cleaned.contains("actual reply"));
+    }
+
+    #[test]
+    fn test_build_passive_candidate_returns_none_for_short_output() {
+        let result = build_passive_candidate("short-req", Some("short"), None, "kimi");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_build_passive_candidate_returns_some_for_valid_output() {
+        let raw = "[CCB_REQ_ID:x]\nThis is a valid reply that is long enough to pass the minimum character threshold for passive capture.";
+        let result = build_passive_candidate("valid-req", Some(raw), None, "claude");
+        assert!(result.is_some());
+        let (content, meta) = result.unwrap();
+        assert!(content.contains("valid reply"));
+        assert_eq!(meta.source.to_string(), "passive_raw_output");
+        assert!(meta.confidence > 0.0 && meta.confidence < 1.0);
+    }
+
+    #[test]
+    fn test_capture_source_confidence_grading() {
+        assert_eq!(CaptureSource::ExplicitReply.default_confidence(), 1.0);
+        assert_eq!(CaptureSource::PassiveRawOutput.default_confidence(), 0.7);
+        assert_eq!(CaptureSource::PassiveGridOutput.default_confidence(), 0.55);
+        assert_eq!(
+            CaptureSource::PassiveTimeoutPartial.default_confidence(),
+            0.3
+        );
+    }
+
+    #[test]
+    fn test_completion_strategy_session_aware_faster() {
+        let mut tracker = CompletionTracker::new();
+        tracker.register(
+            "session-aware".to_string(),
+            "claude".to_string(),
+            EntityId::from_usize(1),
+        );
+        tracker.register(
+            "raw-only".to_string(),
+            "kimi".to_string(),
+            EntityId::from_usize(2),
+        );
+        tracker.set_has_session_listener("session-aware", true);
+
+        std::thread::sleep(Duration::from_millis(3100));
+
+        assert!(tracker.should_finalize_passive("session-aware", Duration::from_secs(2)));
+        assert!(!tracker.should_finalize_passive("raw-only", Duration::from_secs(8)));
+    }
+
+    #[test]
+    fn test_stored_response_v1_backward_compat() {
+        let raw = r#"{
+  "req_id": "legacy-req",
+  "provider": "codex",
+  "status": "success",
+  "content": "legacy content",
+  "created_at_ms": 1000,
+  "updated_at_ms": 2000,
+  "schema_version": 1
+}"#;
+
+        let response: store::StoredResponse = serde_json::from_str(raw).unwrap();
+        assert_eq!(response.req_id, "legacy-req");
+        assert_eq!(response.source, None);
+        assert_eq!(response.confidence, None);
+        assert!(response.warnings.is_empty());
+        assert_eq!(response.raw_len, None);
+        assert_eq!(response.filtered_len, None);
+        assert_eq!(response.truncated, None);
+        assert_eq!(response.finalized_at_ms, None);
     }
 
     #[test]

@@ -21,6 +21,7 @@ struct RawRequestCapture {
     pane: EntityId,
     output: String,
     last_output_changed_at: Instant,
+    started_at: Instant,
 }
 
 impl RawOutputCapture {
@@ -58,12 +59,14 @@ impl RawOutputCapture {
             .entry(pane)
             .or_default()
             .insert(req_id.clone());
+        let now = Instant::now();
         self.captures.insert(
             req_id,
             RawRequestCapture {
                 pane,
                 output: String::new(),
-                last_output_changed_at: Instant::now(),
+                last_output_changed_at: now,
+                started_at: now,
             },
         );
     }
@@ -113,6 +116,10 @@ impl RawOutputCapture {
         self.captures
             .get(req_id)
             .map(|capture| capture.output.clone())
+    }
+
+    pub(crate) fn started_at(&self, req_id: &str) -> Option<Instant> {
+        self.captures.get(req_id).map(|capture| capture.started_at)
     }
 
     pub(crate) fn is_request_stable(&self, req_id: &str, stable_for: Duration) -> bool {

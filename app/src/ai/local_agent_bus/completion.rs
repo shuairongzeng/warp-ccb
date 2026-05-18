@@ -11,6 +11,8 @@ use std::time::{Duration, Instant};
 
 use warpui::EntityId;
 
+use crate::terminal::cli_agent::CLIAgent;
+
 /// Default request timeout in seconds.
 const DEFAULT_TIMEOUT_SECS: u64 = 120;
 
@@ -27,6 +29,18 @@ struct PendingRequest {
     timeout: Duration,
     last_output_len: Option<usize>,
     last_output_changed_at: Instant,
+    has_session_listener: bool,
+    provider_agent: Option<CLIAgent>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompletionStrategy {
+    /// 有 session listener，快速完成
+    SessionAware,
+    /// 无 session listener，中等等待
+    RawOutputOnly,
+    /// Hard cutoff
+    HardTimeout,
 }
 
 impl CompletionTracker {
@@ -49,6 +63,8 @@ impl CompletionTracker {
                 timeout: Duration::from_secs(self.timeout_secs),
                 last_output_len: None,
                 last_output_changed_at: now,
+                has_session_listener: false,
+                provider_agent: None,
             },
         );
     }
@@ -164,6 +180,82 @@ impl CompletionTracker {
             }
         });
         affected
+    }
+
+    /// 判断请求是否应该被完成（不是超时，而是输出稳定后的正常完成）
+    pub fn should_finalize_passive(&self, req_id: &str, output_stable_for: Duration) -> bool {
+        let pending = match self.pending.get(req_id) {
+            Some(p) => p,
+            None => return false,
+        };
+
+        let strategy = self.strategy_for(pending);
+        let elapsed = pending.started_at.elapsed();
+        let min_runtime = self.min_runtime_for(strategy);
+
+        log::debug!(
+            "CompletionTracker: should_finalize_passive req_id={} strategy={:?} elapsed={:?} min_runtime={:?} output_stable_for={:?}",
+            req_id,
+            strategy,
+            elapsed,
+            min_runtime,
+            output_stable_for,
+        );
+
+        match strategy {
+            CompletionStrategy::SessionAware => {
+                elapsed >= min_runtime && output_stable_for >= Duration::from_secs(2)
+            }
+            CompletionStrategy::RawOutputOnly => {
+                elapsed >= min_runtime && output_stable_for >= Duration::from_secs(8)
+            }
+            CompletionStrategy::HardTimeout => false,
+        }
+    }
+
+    fn strategy_for(&self, pending: &PendingRequest) -> CompletionStrategy {
+        if pending.has_session_listener {
+            CompletionStrategy::SessionAware
+        } else {
+            CompletionStrategy::RawOutputOnly
+        }
+    }
+
+    fn min_runtime_for(&self, strategy: CompletionStrategy) -> Duration {
+        match strategy {
+            CompletionStrategy::SessionAware => Duration::from_secs(3),
+            CompletionStrategy::RawOutputOnly => Duration::from_secs(10),
+            CompletionStrategy::HardTimeout => Duration::from_secs(60),
+        }
+    }
+
+    pub fn set_has_session_listener(&mut self, req_id: &str, has: bool) {
+        if let Some(pending) = self.pending.get_mut(req_id) {
+            pending.has_session_listener = has;
+            log::debug!(
+                "CompletionTracker: set_has_session_listener req_id={} has={}",
+                req_id,
+                has
+            );
+        }
+    }
+
+    pub fn set_provider_agent(&mut self, req_id: &str, agent: CLIAgent) {
+        if let Some(pending) = self.pending.get_mut(req_id) {
+            pending.provider_agent = Some(agent);
+        }
+    }
+
+    /// 计算当前输出已经稳定了多久。如果输出长度还在变化，返回 None。
+    pub fn output_stable_duration(&mut self, req_id: &str, output: &str) -> Option<Duration> {
+        let req = self.pending.get_mut(req_id)?;
+        let output_len = output.len();
+        if req.last_output_len != Some(output_len) {
+            req.last_output_len = Some(output_len);
+            req.last_output_changed_at = Instant::now();
+            return None;
+        }
+        Some(req.last_output_changed_at.elapsed())
     }
 }
 

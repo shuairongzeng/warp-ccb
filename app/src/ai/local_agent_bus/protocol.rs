@@ -188,6 +188,12 @@ pub enum BusResponseData {
         status: RequestStatus,
         content: String,
         elapsed_ms: u64,
+        #[serde(default)]
+        source: Option<String>,
+        #[serde(default)]
+        confidence: Option<f64>,
+        #[serde(default)]
+        warnings: Vec<String>,
     },
     ReplyAccepted {
         req_id: String,
@@ -210,6 +216,12 @@ pub struct ReplyEntry {
     pub content: String,
     pub timestamp_ms: u64,
     pub status: RequestStatus,
+    #[serde(default)]
+    pub source: Option<String>,
+    #[serde(default)]
+    pub confidence: Option<f64>,
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
 
 /// A single step in a chain request.

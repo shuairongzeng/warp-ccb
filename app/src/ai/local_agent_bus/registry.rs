@@ -20,6 +20,9 @@ pub struct RequestEntry {
     pub updated_at_ms: u64,
     pub error_message: Option<String>,
     pub reply_content: Option<String>,
+    pub reply_source: Option<String>,
+    pub reply_confidence: Option<f64>,
+    pub reply_warnings: Vec<String>,
     pub callback_provider: Option<String>,
     pub caller_terminal_view_id: Option<EntityId>,
     pub caller_session_id: Option<String>,
@@ -131,6 +134,21 @@ impl RequestRegistry {
         }
     }
 
+    /// Store reply capture metadata for a request.
+    pub fn set_reply_metadata(
+        &mut self,
+        req_id: &str,
+        source: Option<String>,
+        confidence: Option<f64>,
+        warnings: Vec<String>,
+    ) {
+        if let Some(entry) = self.entries.get_mut(req_id) {
+            entry.reply_source = source;
+            entry.reply_confidence = confidence;
+            entry.reply_warnings = warnings;
+        }
+    }
+
     /// Query replies matching the given criteria.
     pub fn query_replies(
         &self,
@@ -170,6 +188,9 @@ impl RequestRegistry {
                     .unwrap_or_default(),
                 timestamp_ms: e.updated_at_ms,
                 status: e.status,
+                source: e.reply_source.clone(),
+                confidence: e.reply_confidence,
+                warnings: e.reply_warnings.clone(),
             })
             .collect()
     }
@@ -218,6 +239,9 @@ mod tests {
             updated_at_ms: 1000,
             error_message: None,
             reply_content: None,
+            reply_source: None,
+            reply_confidence: None,
+            reply_warnings: Vec::new(),
             callback_provider: None,
             caller_terminal_view_id: Some(EntityId::from_usize(2247)),
             caller_session_id: Some("caller-session".to_string()),
@@ -351,6 +375,12 @@ mod tests {
             Some("D:\\GitHub\\warp-ccb")
         );
         reg.set_reply_content("r1", "Hello world".to_string());
+        reg.set_reply_metadata(
+            "r1",
+            Some("explicit_reply".to_string()),
+            Some(1.0),
+            vec!["metadata-test".to_string()],
+        );
         assert_eq!(
             reg.get("r1").unwrap().reply_content,
             Some("Hello world".to_string())
@@ -358,5 +388,8 @@ mod tests {
 
         let replies = reg.query_replies("claude", None, 10);
         assert_eq!(replies[0].content, "Hello world");
+        assert_eq!(replies[0].source.as_deref(), Some("explicit_reply"));
+        assert_eq!(replies[0].confidence, Some(1.0));
+        assert_eq!(replies[0].warnings, vec!["metadata-test"]);
     }
 }

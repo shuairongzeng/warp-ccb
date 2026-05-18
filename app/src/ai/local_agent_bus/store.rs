@@ -18,10 +18,24 @@ pub struct StoredResponse {
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
     pub schema_version: u32,
+    #[serde(default)]
+    pub source: Option<String>,
+    #[serde(default)]
+    pub confidence: Option<f64>,
+    #[serde(default)]
+    pub warnings: Vec<String>,
+    #[serde(default)]
+    pub raw_len: Option<usize>,
+    #[serde(default)]
+    pub filtered_len: Option<usize>,
+    #[serde(default)]
+    pub truncated: Option<bool>,
+    #[serde(default)]
+    pub finalized_at_ms: Option<u64>,
 }
 
 impl StoredResponse {
-    pub const SCHEMA_VERSION: u32 = 1;
+    pub const SCHEMA_VERSION: u32 = 2;
 }
 
 impl ResponseStore {
@@ -37,7 +51,9 @@ impl ResponseStore {
         let target = self.base_dir.join(&filename);
         let temp = self.base_dir.join(format!("{}.tmp", response.req_id));
 
-        let json = serde_json::to_string_pretty(response)?;
+        let mut response = response.clone();
+        response.schema_version = StoredResponse::SCHEMA_VERSION;
+        let json = serde_json::to_string_pretty(&response)?;
         std::fs::write(&temp, json)?;
         std::fs::rename(&temp, &target)?;
 
@@ -107,7 +123,6 @@ impl ResponseStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
 
     #[test]
     fn test_write_and_read() {
@@ -123,6 +138,13 @@ mod tests {
             created_at_ms: 1000,
             updated_at_ms: 2000,
             schema_version: StoredResponse::SCHEMA_VERSION,
+            source: None,
+            confidence: None,
+            warnings: Vec::new(),
+            raw_len: None,
+            filtered_len: None,
+            truncated: None,
+            finalized_at_ms: None,
         };
 
         store.write(&resp).unwrap();
@@ -131,6 +153,77 @@ mod tests {
         assert_eq!(loaded.provider, "claude");
         assert_eq!(loaded.status, RequestStatus::Success);
         assert_eq!(loaded.content, "hello world");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_v2_metadata_round_trip() {
+        let dir = std::env::temp_dir().join("warp-ccb-test-store-v2");
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = ResponseStore::new(dir.clone());
+
+        let resp = StoredResponse {
+            req_id: "test-req-v2".to_string(),
+            provider: "kimi".to_string(),
+            status: RequestStatus::Success,
+            content: "hello with metadata".to_string(),
+            created_at_ms: 1000,
+            updated_at_ms: 2000,
+            schema_version: StoredResponse::SCHEMA_VERSION,
+            source: Some("passive_raw_output".to_string()),
+            confidence: Some(0.7),
+            warnings: vec!["filtered_instruction_echo".to_string()],
+            raw_len: Some(2048),
+            filtered_len: Some(128),
+            truncated: Some(false),
+            finalized_at_ms: Some(2500),
+        };
+
+        store.write(&resp).unwrap();
+        let loaded = store.read("test-req-v2").unwrap();
+
+        assert_eq!(loaded.schema_version, 2);
+        assert_eq!(loaded.source.as_deref(), Some("passive_raw_output"));
+        assert_eq!(loaded.confidence, Some(0.7));
+        assert_eq!(loaded.warnings, vec!["filtered_instruction_echo"]);
+        assert_eq!(loaded.raw_len, Some(2048));
+        assert_eq!(loaded.filtered_len, Some(128));
+        assert_eq!(loaded.truncated, Some(false));
+        assert_eq!(loaded.finalized_at_ms, Some(2500));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_v1_response_defaults_metadata() {
+        let dir = std::env::temp_dir().join("warp-ccb-test-store-v1");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = ResponseStore::new(dir.clone());
+        std::fs::write(
+            dir.join("legacy-req.json"),
+            r#"{
+  "req_id": "legacy-req",
+  "provider": "codex",
+  "status": "success",
+  "content": "legacy content",
+  "created_at_ms": 1000,
+  "updated_at_ms": 2000,
+  "schema_version": 1
+}"#,
+        )
+        .unwrap();
+
+        let loaded = store.read("legacy-req").unwrap();
+
+        assert_eq!(loaded.source, None);
+        assert_eq!(loaded.confidence, None);
+        assert!(loaded.warnings.is_empty());
+        assert_eq!(loaded.raw_len, None);
+        assert_eq!(loaded.filtered_len, None);
+        assert_eq!(loaded.truncated, None);
+        assert_eq!(loaded.finalized_at_ms, None);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -150,7 +243,14 @@ mod tests {
                     content: format!("response {}", i),
                     created_at_ms: 1000 + i as u64,
                     updated_at_ms: 2000 + i as u64,
-                    schema_version: 1,
+                    schema_version: StoredResponse::SCHEMA_VERSION,
+                    source: None,
+                    confidence: None,
+                    warnings: Vec::new(),
+                    raw_len: None,
+                    filtered_len: None,
+                    truncated: None,
+                    finalized_at_ms: None,
                 })
                 .unwrap();
         }
