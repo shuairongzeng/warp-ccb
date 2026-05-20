@@ -78,6 +78,10 @@ pub struct LocalAgentBusModel {
     pane_group_handle: Option<WeakViewHandle<PaneGroup>>,
     /// Launch requests waiting for a new pane to be created.
     pending_launches: Vec<PendingLaunch>,
+    /// Whether a pane creation via PaneGroup is currently in flight.
+    pane_creation_in_progress: bool,
+    /// Consecutive pane creation attempts without success (bounds retries).
+    pane_creation_attempts: u32,
     /// Wait clients: req_id -> list of oneshot senders waiting for completion.
     waiting_clients: HashMap<String, Vec<tokio::sync::oneshot::Sender<BusResponse>>>,
     cmd_rx: tokio::sync::mpsc::Receiver<(BusCommand, tokio::sync::oneshot::Sender<BusResponse>)>,
@@ -172,6 +176,8 @@ impl LocalAgentBusModel {
             active_chains: HashMap::new(),
             pane_group_handle: None,
             pending_launches: Vec::new(),
+            pane_creation_in_progress: false,
+            pane_creation_attempts: 0,
             waiting_clients: HashMap::new(),
             cmd_rx,
         })
@@ -2022,96 +2028,66 @@ impl LocalAgentBusModel {
 
         // Find an idle terminal. If none, try creating one via PaneGroup.
         let idle_view_id = self.find_idle_terminal(ctx);
+        log::info!(
+            "LocalAgentBus: handle_launch({}) — find_idle_terminal={:?}, terminal_handles={}, pending={}, pane_creation_in_progress={}",
+            provider,
+            idle_view_id,
+            self.terminal_handles.len(),
+            self.pending_launches.len(),
+            self.pane_creation_in_progress
+        );
         let view_id = match idle_view_id {
             Some(id) => id,
             None => {
-                // No idle terminal. Try to create one via PaneGroup.
-                if self.create_terminal_pane(ctx) {
-                    // Pane creation is scheduled async. Store the launch for later.
-                    self.pending_launches.push(PendingLaunch {
-                        provider: provider.clone(),
-                        agent,
-                        prompt,
-                        cwd,
-                    });
-                    return BusResponse::ok(BusResponseData::Launched {
-                        provider,
-                        session_id: None,
-                        terminal_view_id: 0, // pending
-                    });
-                }
-                return BusResponse::error("no idle terminal available for launch");
-            }
-        };
-
-        // Build the CLI startup command.
-        let command = build_launch_command(&agent, &provider, Some(view_id), prompt.as_deref());
-
-        // Write the command to the terminal's PTY.
-        let weak_handle = match self.terminal_handles.get(&view_id) {
-            Some(h) => h.clone(),
-            None => return BusResponse::error("terminal handle lost"),
-        };
-
-        match weak_handle.upgrade(ctx) {
-            Some(handle) => {
-                let bytes: Vec<u8> = command.into_bytes();
-                handle.update(ctx, |view, ctx| {
-                    view.write_to_pty(bytes, ctx);
+                // No idle terminal. Queue the launch and schedule pane creation if not already in progress.
+                self.pending_launches.push(PendingLaunch {
+                    provider: provider.clone(),
+                    agent,
+                    prompt,
+                    cwd,
                 });
-                log::info!(
-                    "LocalAgentBus: launched {} in terminal {:?}",
-                    provider,
-                    view_id
-                );
-                self.bus_launched_sessions.insert(view_id, agent);
-
-                // Register a placeholder only for agents that will emit a Warp session event.
-                // Agents like Kimi currently have no listener, so the Bus-owned launch map is
-                // their online signal.
-                if is_agent_supported(&agent) {
-                    let now_ms = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_millis() as u64;
-                    self.registry.insert(registry::RequestEntry {
-                        req_id: format!("launch-{}", view_id),
-                        provider: provider.clone(),
-                        caller: "launch".to_string(),
-                        terminal_view_id: view_id,
-                        session_id: None,
-                        cwd: None,
-                        status: RequestStatus::Injecting,
-                        created_at_ms: now_ms,
-                        updated_at_ms: now_ms,
-                        error_message: None,
-                        reply_content: None,
-                        reply_source: None,
-                        reply_confidence: None,
-                        reply_warnings: Vec::new(),
-                        callback_provider: None,
-                        caller_terminal_view_id: None,
-                        caller_session_id: None,
-                        caller_cwd: None,
-                    });
+                if !self.pane_creation_in_progress {
+                    if self.create_terminal_pane(ctx) {
+                        self.pane_creation_in_progress = true;
+                    } else {
+                        self.pending_launches.pop();
+                        return BusResponse::error("no idle terminal and pane creation failed");
+                    }
                 }
-
-                if let Some(ref _dir) = cwd {
-                    log::warn!("LocalAgentBus: cwd not yet supported for launch, agent will use terminal's cwd");
-                }
-
-                BusResponse::ok(BusResponseData::Launched {
+                return BusResponse::ok(BusResponseData::Launched {
                     provider,
                     session_id: None,
-                    terminal_view_id: view_id.to_string().parse().unwrap_or(0),
-                })
+                    terminal_view_id: 0, // pending
+                });
             }
-            None => BusResponse::error("terminal view no longer exists"),
+        };
+
+        if self.inject_launch_to_terminal(
+            view_id,
+            &PendingLaunch {
+                provider: provider.clone(),
+                agent,
+                prompt,
+                cwd: cwd.clone(),
+            },
+            ctx,
+        ) {
+            if let Some(ref _dir) = cwd {
+                log::warn!("LocalAgentBus: cwd not yet supported for launch, agent will use terminal's cwd");
+            }
+
+            BusResponse::ok(BusResponseData::Launched {
+                provider,
+                session_id: None,
+                terminal_view_id: view_id.to_string().parse().unwrap_or(0),
+            })
+        } else {
+            BusResponse::error("terminal view no longer exists")
         }
     }
 
     /// Find a terminal without an active CLI agent session AND without active requests.
-    fn find_idle_terminal(&self, ctx: &mut ModelContext<Self>) -> Option<EntityId> {
+    fn find_idle_terminal(&mut self, ctx: &mut ModelContext<Self>) -> Option<EntityId> {
         let active_session_views: HashSet<EntityId> = {
             let sessions_model = CLIAgentSessionsModel::as_ref(ctx);
             sessions_model
@@ -2140,7 +2116,10 @@ impl LocalAgentBusModel {
                     let active_block = model.block_list().active_block();
                     active_block_blocks_bus_launch(active_block.started(), active_block.finished())
                 }),
-                None => true,
+                None => {
+                    self.bus_launched_sessions.remove(&view_id);
+                    true
+                }
             };
             log::info!(
                 "LocalAgentBus:   terminal {:?} — session={}, bus_launched={}, active={}, running_block={}",
@@ -2162,17 +2141,28 @@ impl LocalAgentBusModel {
         let weak_pg = match &self.pane_group_handle {
             Some(h) => h.clone(),
             None => {
-                log::warn!("LocalAgentBus: no PaneGroup handle registered");
+                log::error!(
+                    "LocalAgentBus: no PaneGroup handle registered — \
+                     auto pane creation impossible (pending_launches={})",
+                    self.pending_launches.len()
+                );
                 return false;
             }
         };
 
         match weak_pg.upgrade(ctx) {
             Some(pg_handle) => {
+                let pending_count = self.pending_launches.len();
                 // Spawn the pane creation on the next event loop tick to avoid reentrancy.
                 ctx.spawn(
                     async move {},
                     move |me, _meta, ctx| {
+                        log::info!(
+                            "LocalAgentBus: spawn callback firing — pending={}, terminal_handles={}",
+                            me.pending_launches.len(),
+                            me.terminal_handles.len()
+                        );
+
                         // Create the pane and get back its EntityId + ViewHandle.
                         let new_terminal = pg_handle.update(ctx, |pg, ctx| {
                             pg.create_agent_terminal_for_bus(ctx)
@@ -2188,69 +2178,185 @@ impl LocalAgentBusModel {
                                 "LocalAgentBus: manually registered new terminal {:?} after pane creation",
                                 view_id
                             );
+
+                            // Directly inject the first pending launch into the new pane
+                            // to avoid the race where find_idle_terminal rejects it due to
+                            // shell boot output setting active_block=true.
+                            if !me.pending_launches.is_empty() {
+                                let launch = me.pending_launches.remove(0);
+                                if me.inject_launch_to_terminal(view_id, &launch, ctx) {
+                                    log::info!(
+                                        "LocalAgentBus: launched {} in new terminal {:?} via direct inject",
+                                        launch.provider,
+                                        view_id
+                                    );
+                                } else {
+                                    log::warn!(
+                                        "LocalAgentBus: direct inject FAILED for {} in terminal {:?}, putting back",
+                                        launch.provider, view_id
+                                    );
+                                    me.pending_launches.insert(0, launch);
+                                }
+                            }
+                        } else {
+                            log::error!(
+                                "LocalAgentBus: pane creation returned no terminal — \
+                                 add_pane may have failed silently (pending={}, attempts={})",
+                                me.pending_launches.len(),
+                                me.pane_creation_attempts
+                            );
                         }
 
-                        // Process pending launches now that the terminal is registered.
                         me.process_pending_launches(ctx);
                     },
                 );
-                log::info!("LocalAgentBus: scheduled terminal pane creation via PaneGroup");
+                log::info!(
+                    "LocalAgentBus: scheduled terminal pane creation via PaneGroup (pending={})",
+                    pending_count
+                );
                 true
             }
             None => {
-                log::warn!("LocalAgentBus: PaneGroup handle no longer valid");
+                log::error!(
+                    "LocalAgentBus: PaneGroup handle no longer valid — \
+                     weak upgrade failed (pending={})",
+                    self.pending_launches.len()
+                );
                 false
             }
+        }
+    }
+
+    /// Inject a launch command into a terminal view's PTY and update bus state.
+    fn inject_launch_to_terminal(
+        &mut self,
+        view_id: EntityId,
+        launch: &PendingLaunch,
+        ctx: &mut ModelContext<Self>,
+    ) -> bool {
+        let command = build_launch_command(
+            &launch.agent,
+            &launch.provider,
+            Some(view_id),
+            launch.prompt.as_deref(),
+        );
+        let weak_handle = match self.terminal_handles.get(&view_id) {
+            Some(h) => h.clone(),
+            None => {
+                log::warn!(
+                    "LocalAgentBus: inject_launch_to_terminal({}) — no handle for view {:?}",
+                    launch.provider, view_id
+                );
+                return false;
+            }
+        };
+
+        match weak_handle.upgrade(ctx) {
+            Some(handle) => {
+                let bytes: Vec<u8> = command.into_bytes();
+                handle.update(ctx, |view, ctx| {
+                    view.write_to_pty(bytes, ctx);
+                });
+                self.bus_launched_sessions.insert(view_id, launch.agent);
+                self.pane_creation_attempts = 0;
+
+                if is_agent_supported(&launch.agent) {
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64;
+                    self.registry.insert(registry::RequestEntry {
+                        req_id: format!("launch-{}", view_id),
+                        provider: launch.provider.clone(),
+                        caller: "launch".to_string(),
+                        terminal_view_id: view_id,
+                        session_id: None,
+                        cwd: launch.cwd.clone(),
+                        status: RequestStatus::Injecting,
+                        created_at_ms: now_ms,
+                        updated_at_ms: now_ms,
+                        error_message: None,
+                        reply_content: None,
+                        reply_source: None,
+                        reply_confidence: None,
+                        reply_warnings: Vec::new(),
+                        callback_provider: None,
+                        caller_terminal_view_id: None,
+                        caller_session_id: None,
+                        caller_cwd: None,
+                    });
+                }
+                true
+            }
+            None => false,
         }
     }
 
     /// Process pending launch requests after a new pane was created.
     pub fn process_pending_launches(&mut self, ctx: &mut ModelContext<Self>) {
         if self.pending_launches.is_empty() {
+            self.pane_creation_in_progress = false;
+            self.pane_creation_attempts = 0;
             return;
         }
 
+        let mut still_pending = Vec::new();
         let pending = std::mem::take(&mut self.pending_launches);
         for launch in pending {
             let idle = self.find_idle_terminal(ctx);
             let view_id = match idle {
                 Some(id) => id,
                 None => {
-                    log::warn!(
-                        "LocalAgentBus: still no idle terminal after pane creation for {}",
-                        launch.provider
-                    );
+                    still_pending.push(launch);
                     continue;
                 }
             };
 
-            let command = build_launch_command(
-                &launch.agent,
-                &launch.provider,
-                Some(view_id),
-                launch.prompt.as_deref(),
-            );
-            let weak_handle = match self.terminal_handles.get(&view_id) {
-                Some(h) => h.clone(),
-                None => continue,
-            };
-
-            match weak_handle.upgrade(ctx) {
-                Some(handle) => {
-                    let bytes: Vec<u8> = command.into_bytes();
-                    handle.update(ctx, |view, ctx| {
-                        view.write_to_pty(bytes, ctx);
-                    });
-                    log::info!(
-                        "LocalAgentBus: launched {} in new terminal {:?}",
-                        launch.provider,
-                        view_id
-                    );
-                    self.bus_launched_sessions.insert(view_id, launch.agent);
-                }
-                None => continue,
+            if self.inject_launch_to_terminal(view_id, &launch, ctx) {
+                log::info!(
+                    "LocalAgentBus: launched {} in new terminal {:?}",
+                    launch.provider,
+                    view_id
+                );
+            } else {
+                still_pending.push(launch);
             }
         }
+
+        if !still_pending.is_empty() {
+            const MAX_PANE_CREATION_ATTEMPTS: u32 = 10;
+            self.pending_launches = still_pending;
+
+            if self.pane_creation_attempts >= MAX_PANE_CREATION_ATTEMPTS {
+                log::error!(
+                    "LocalAgentBus: exceeded {} pane creation attempts, dropping {} pending launches",
+                    MAX_PANE_CREATION_ATTEMPTS,
+                    self.pending_launches.len()
+                );
+                self.pending_launches.clear();
+                self.pane_creation_in_progress = false;
+                self.pane_creation_attempts = 0;
+                return;
+            }
+
+            log::info!(
+                "LocalAgentBus: {} launches still pending (attempt {}/{}), scheduling another pane creation",
+                self.pending_launches.len(),
+                self.pane_creation_attempts + 1,
+                MAX_PANE_CREATION_ATTEMPTS
+            );
+            if self.create_terminal_pane(ctx) {
+                self.pane_creation_attempts += 1;
+                return;
+            }
+            log::error!(
+                "LocalAgentBus: failed to create pane for {} remaining pending launches",
+                self.pending_launches.len()
+            );
+            self.pending_launches.clear();
+        }
+        self.pane_creation_in_progress = false;
+        self.pane_creation_attempts = 0;
     }
 
     /// Inject a prompt into a terminal view's PTY using the stored weak handle.

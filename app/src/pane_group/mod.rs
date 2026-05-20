@@ -3806,14 +3806,23 @@ impl PaneGroup {
             };
             (PaneData::new(pane_id), initial_focus)
         };
-        Self::new_internal(
+        let pane_group = Self::new_internal(
             tips_completed,
             user_default_shell_unsupported_banner_model_handle,
             server_api,
             model_event_sender,
             Box::new(initial_layout),
             ctx,
-        )
+        );
+
+        {
+            let weak_pg = ctx.handle();
+            crate::ai::local_agent_bus::LocalAgentBusModel::handle(ctx).update(ctx, |bus, _ctx| {
+                bus.register_pane_group_handle(weak_pg);
+            });
+        }
+
+        pane_group
     }
 
     pub fn new_for_shared_session_viewer(
@@ -3847,14 +3856,23 @@ impl PaneGroup {
                 ctx,
             )
         };
-        Self::new_internal(
+        let pane_group = Self::new_internal(
             tips_completed,
             user_default_shell_unsupported_banner_model_handle,
             server_api,
             model_event_sender,
             Box::new(initial_layout),
             ctx,
-        )
+        );
+
+        {
+            let weak_pg = ctx.handle();
+            crate::ai::local_agent_bus::LocalAgentBusModel::handle(ctx).update(ctx, |bus, _ctx| {
+                bus.register_pane_group_handle(weak_pg);
+            });
+        }
+
+        pane_group
     }
 
     /// Create a new pane group for a view-only cloud conversation.
@@ -3891,14 +3909,23 @@ impl PaneGroup {
                 ctx,
             )
         };
-        Self::new_internal(
+        let pane_group = Self::new_internal(
             tips_completed,
             user_default_shell_unsupported_banner_model_handle,
             server_api,
             model_event_sender,
             Box::new(initial_layout),
             ctx,
-        )
+        );
+
+        {
+            let weak_pg = ctx.handle();
+            crate::ai::local_agent_bus::LocalAgentBusModel::handle(ctx).update(ctx, |bus, _ctx| {
+                bus.register_pane_group_handle(weak_pg);
+            });
+        }
+
+        pane_group
     }
 
     /// Create a new pane group with a loading state for a conversation viewer.
@@ -3938,14 +3965,23 @@ impl PaneGroup {
                 ctx,
             )
         };
-        Self::new_internal(
+        let pane_group = Self::new_internal(
             tips_completed,
             user_default_shell_unsupported_banner_model_handle,
             server_api,
             model_event_sender,
             Box::new(initial_layout),
             ctx,
-        )
+        );
+
+        {
+            let weak_pg = ctx.handle();
+            crate::ai::local_agent_bus::LocalAgentBusModel::handle(ctx).update(ctx, |bus, _ctx| {
+                bus.register_pane_group_handle(weak_pg);
+            });
+        }
+
+        pane_group
     }
 
     /// Load conversation data into a conversation viewer that was created with a loading state.
@@ -4243,17 +4279,26 @@ impl PaneGroup {
         &mut self,
         ctx: &mut ViewContext<Self>,
     ) -> Option<(EntityId, ViewHandle<TerminalView>)> {
+        let focused = self.focused_pane_id(ctx);
         let new_pane_id = self.add_terminal_pane(Direction::Right, None, ctx);
-        log::info!(
-            "PaneGroup: created agent terminal pane via split: {:?}",
-            new_pane_id
-        );
 
         let pane_id: PaneId = new_pane_id.into();
-        let pane_content = self.pane_contents.get(&pane_id)?;
-        let terminal_pane = pane_content.as_any().downcast_ref::<TerminalPane>()?;
+        let pane_content = self.pane_contents.get(&pane_id);
+        if pane_content.is_none() {
+            log::error!(
+                "PaneGroup: create_agent_terminal_for_bus failed — pane {:?} not in pane_contents \
+                 (focused_pane={:?}, pane_count={})",
+                pane_id, focused, self.pane_count()
+            );
+            return None;
+        }
+        let terminal_pane = pane_content?.as_any().downcast_ref::<TerminalPane>()?;
         let view_handle = terminal_pane.terminal_view(ctx);
         let entity_id = view_handle.id();
+        log::info!(
+            "PaneGroup: created agent terminal pane via split: {:?} (entity_id={:?})",
+            new_pane_id, entity_id
+        );
         Some((entity_id, view_handle))
     }
 
