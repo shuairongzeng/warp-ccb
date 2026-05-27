@@ -1046,6 +1046,11 @@ impl TerminalView {
             .session(self.view_id)
             .filter(|session| session.listener.is_some())?;
 
+        // Prioritize alias over provider name or prompt text.
+        if let Some(ref alias) = session.session_context.alias {
+            return Some(alias.clone());
+        }
+
         if *TabSettings::as_ref(ctx).use_latest_user_prompt_as_conversation_title_in_tab_names {
             session
                 .session_context

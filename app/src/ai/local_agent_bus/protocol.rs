@@ -4,6 +4,7 @@
 //! Each request is a single JSON line sent over Unix socket or Windows named pipe.
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 /// Protocol version
 pub const PROTOCOL_VERSION: u32 = 1;
@@ -77,9 +78,17 @@ pub enum BusCommand {
     Launch {
         provider: String,
         #[serde(skip_serializing_if = "Option::is_none")]
+        alias: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
         prompt: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         cwd: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        tab_config_name: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        params: Option<HashMap<String, String>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        target_view_id: Option<u64>,
     },
     Chain {
         steps: Vec<ChainStep>,
@@ -91,6 +100,13 @@ pub enum BusCommand {
         req_id: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         timeout_ms: Option<u64>,
+    },
+    ClosePane {
+        view_id: u64,
+    },
+    CloseSession {
+        provider: String,
+        view_id: u64,
     },
     #[serde(alias = "Reply")]
     Reply {
@@ -179,6 +195,10 @@ pub enum BusResponseData {
         session_id: Option<String>,
         terminal_view_id: u64,
     },
+    TabConfigLaunched {
+        config_name: String,
+        pane_ids: HashMap<String, u64>,
+    },
     ChainStarted {
         chain_id: String,
         step_count: usize,
@@ -198,6 +218,13 @@ pub enum BusResponseData {
     ReplyAccepted {
         req_id: String,
         already_finalized: bool,
+    },
+    PaneClosed {
+        view_id: u64,
+    },
+    SessionClosed {
+        provider: String,
+        view_id: u64,
     },
     Error {
         message: String,
@@ -285,6 +312,8 @@ impl std::fmt::Display for RequestStatus {
 pub struct SessionInfo {
     pub provider: String,
     pub terminal_view_id: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub alias: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -530,6 +559,173 @@ mod tests {
             let json = serde_json::to_string(&s).unwrap();
             let de: RequestStatus = serde_json::from_str(&json).unwrap();
             assert_eq!(s, de);
+        }
+    }
+
+    #[test]
+    fn test_serialize_close_pane_request() {
+        let req = BusRequest {
+            v: 1,
+            token: "test-token".to_string(),
+            command: BusCommand::ClosePane { view_id: 42 },
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("\"type\":\"close_pane\""));
+        assert!(json.contains("\"view_id\":42"));
+
+        let de: BusRequest = serde_json::from_str(&json).unwrap();
+        match de.command {
+            BusCommand::ClosePane { view_id } => assert_eq!(view_id, 42),
+            _ => panic!("expected ClosePane"),
+        }
+    }
+
+    #[test]
+    fn test_serialize_close_session_request() {
+        let req = BusRequest {
+            v: 1,
+            token: "test-token".to_string(),
+            command: BusCommand::CloseSession {
+                provider: "claude".to_string(),
+                view_id: 99,
+            },
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("\"type\":\"close_session\""));
+        assert!(json.contains("\"provider\":\"claude\""));
+        assert!(json.contains("\"view_id\":99"));
+
+        let de: BusRequest = serde_json::from_str(&json).unwrap();
+        match de.command {
+            BusCommand::CloseSession { provider, view_id } => {
+                assert_eq!(provider, "claude");
+                assert_eq!(view_id, 99);
+            }
+            _ => panic!("expected CloseSession"),
+        }
+    }
+
+    #[test]
+    fn test_serialize_pane_closed_response() {
+        let resp = BusResponse::ok(BusResponseData::PaneClosed { view_id: 42 });
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"ok\":true"));
+        assert!(json.contains("\"type\":\"pane_closed\""));
+        assert!(json.contains("\"view_id\":42"));
+
+        let de: BusResponse = serde_json::from_str(&json).unwrap();
+        assert!(de.ok);
+        match de.data {
+            BusResponseData::PaneClosed { view_id } => assert_eq!(view_id, 42),
+            _ => panic!("expected PaneClosed"),
+        }
+    }
+
+    #[test]
+    fn test_serialize_session_closed_response() {
+        let resp = BusResponse::ok(BusResponseData::SessionClosed {
+            provider: "codex".to_string(),
+            view_id: 77,
+        });
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"ok\":true"));
+        assert!(json.contains("\"type\":\"session_closed\""));
+        assert!(json.contains("\"provider\":\"codex\""));
+        assert!(json.contains("\"view_id\":77"));
+
+        let de: BusResponse = serde_json::from_str(&json).unwrap();
+        assert!(de.ok);
+        match de.data {
+            BusResponseData::SessionClosed { provider, view_id } => {
+                assert_eq!(provider, "codex");
+                assert_eq!(view_id, 77);
+            }
+            _ => panic!("expected SessionClosed"),
+        }
+    }
+
+    #[test]
+    fn test_serialize_extended_launch() {
+        let mut params = HashMap::new();
+        params.insert("project_dir".to_string(), "/project".to_string());
+        let req = BusRequest {
+            v: 1,
+            token: "test-token".to_string(),
+            command: BusCommand::Launch {
+                provider: "claude".to_string(),
+                alias: None,
+                prompt: Some("hello".to_string()),
+                cwd: Some("/tmp".to_string()),
+                tab_config_name: Some("my_team".to_string()),
+                params: Some(params),
+                target_view_id: Some(42),
+            },
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("\"type\":\"launch\""));
+        assert!(json.contains("\"provider\":\"claude\""));
+        assert!(json.contains("\"tab_config_name\":\"my_team\""));
+        assert!(json.contains("\"target_view_id\":42"));
+        assert!(json.contains("\"project_dir\":\"/project\""));
+    }
+
+    #[test]
+    fn test_deserialize_old_launch_backward_compat() {
+        let json = r#"{
+            "v": 1,
+            "token": "tok",
+            "type": "launch",
+            "provider": "codex",
+            "prompt": "hello",
+            "cwd": "/tmp"
+        }"#;
+
+        let req: BusRequest = serde_json::from_str(json).unwrap();
+        match req.command {
+            BusCommand::Launch {
+                provider,
+                alias,
+                prompt,
+                cwd,
+                tab_config_name,
+                params,
+                target_view_id,
+            } => {
+                assert_eq!(provider, "codex");
+                assert!(alias.is_none());
+                assert_eq!(prompt, Some("hello".to_string()));
+                assert_eq!(cwd, Some("/tmp".to_string()));
+                assert!(tab_config_name.is_none());
+                assert!(params.is_none());
+                assert!(target_view_id.is_none());
+            }
+            _ => panic!("expected Launch"),
+        }
+    }
+
+    #[test]
+    fn test_roundtrip_tab_config_launched() {
+        let mut pane_ids = HashMap::new();
+        pane_ids.insert("pane0".to_string(), 100);
+        pane_ids.insert("pane1".to_string(), 101);
+        let resp = BusResponse::ok(BusResponseData::TabConfigLaunched {
+            config_name: "my_team".to_string(),
+            pane_ids,
+        });
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"ok\":true"));
+        assert!(json.contains("\"type\":\"tab_config_launched\""));
+        assert!(json.contains("\"config_name\":\"my_team\""));
+
+        let de: BusResponse = serde_json::from_str(&json).unwrap();
+        assert!(de.ok);
+        match de.data {
+            BusResponseData::TabConfigLaunched { config_name, pane_ids } => {
+                assert_eq!(config_name, "my_team");
+                assert_eq!(pane_ids.get("pane0"), Some(&100));
+                assert_eq!(pane_ids.get("pane1"), Some(&101));
+            }
+            _ => panic!("expected TabConfigLaunched"),
         }
     }
 }

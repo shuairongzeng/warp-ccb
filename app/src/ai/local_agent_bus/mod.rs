@@ -80,6 +80,8 @@ pub struct LocalAgentBusModel {
     pending_launches: Vec<PendingLaunch>,
     /// Whether a pane creation via PaneGroup is currently in flight.
     pane_creation_in_progress: bool,
+    /// Alias → view_id mapping (e.g. "writer" → pane EntityId).
+    alias_to_view_id: HashMap<String, EntityId>,
     /// Consecutive pane creation attempts without success (bounds retries).
     pane_creation_attempts: u32,
     /// Wait clients: req_id -> list of oneshot senders waiting for completion.
@@ -177,6 +179,7 @@ impl LocalAgentBusModel {
             pane_group_handle: None,
             pending_launches: Vec::new(),
             pane_creation_in_progress: false,
+        alias_to_view_id: HashMap::new(),
             pane_creation_attempts: 0,
             waiting_clients: HashMap::new(),
             cmd_rx,
@@ -201,6 +204,8 @@ impl LocalAgentBusModel {
     /// Remove a terminal handle when the session ends.
     pub fn deregister_terminal_handle(&mut self, view_id: EntityId) {
         self.terminal_handles.remove(&view_id);
+        // Remove alias mappings pointing to this view_id
+        self.alias_to_view_id.retain(|_alias, &mut vid| vid != view_id);
         let removed_agent = self.bus_launched_sessions.remove(&view_id);
         log::info!(
             "CCB会话注销: pane={} removed_bus_provider={:?}",
@@ -837,9 +842,11 @@ impl LocalAgentBusModel {
 
             BusCommand::Launch {
                 provider,
+                alias,
                 prompt,
                 cwd,
-            } => self.handle_launch(provider, prompt, cwd, ctx),
+                ..
+            } => self.handle_launch(provider, alias, prompt, cwd, ctx),
 
             BusCommand::Chain { steps, caller } => self.handle_chain(steps, caller, ctx),
 
@@ -854,6 +861,14 @@ impl LocalAgentBusModel {
             BusCommand::Wait { .. } => {
                 // Handled in process_commands before reaching here
                 BusResponse::error("wait command not handled in dispatch")
+            }
+
+            BusCommand::ClosePane { view_id } => {
+                self.handle_close_pane(view_id, ctx)
+            }
+
+            BusCommand::CloseSession { provider, view_id } => {
+                self.handle_close_session(provider, view_id, ctx)
             }
         }
     }
@@ -948,6 +963,23 @@ impl LocalAgentBusModel {
                             .unwrap_or_default()
                             .as_millis() as u64;
                         let callback_provider = Self::extract_callback(&caller, &provider);
+                        let caller_terminal_view_id = match caller_terminal_view_id {
+                            Some(id) => Some(id),
+                            None => {
+                                // Lightweight lookup only (no find_session to avoid re-entrancy)
+                                self.alias_to_view_id.get(&caller)
+                                    .filter(|id| self.terminal_handles.contains_key(id))
+                                    .copied()
+                                    .or_else(|| {
+                                        resolve_agent(&caller).and_then(|agent| {
+                                            self.bus_launched_sessions.iter()
+                                                .find(|(_, a)| **a == agent)
+                                                .filter(|(id, _)| self.terminal_handles.contains_key(id))
+                                                .map(|(id, _)| *id)
+                                        })
+                                    })
+                            }
+                        };
                         self.registry.insert(registry::RequestEntry {
                             req_id: req_id.clone(),
                             provider: provider.clone(),
@@ -1029,6 +1061,58 @@ impl LocalAgentBusModel {
             .as_millis() as u64;
 
         let callback_provider = Self::extract_callback(&caller, &provider);
+
+        // Auto-resolve caller_terminal_view_id when not provided by the caller.
+        // This happens when the caller's pane doesn't have WARP_CCB_TERMINAL_VIEW_ID set
+        // (e.g. user's own Claude pane, not launched by warp-ccb).
+        // NOTE: We only do lightweight HashMap lookups here (alias_to_view_id, terminal_handles)
+        // because find_session() calls refresh_bus_launched_sessions_from_terminal_outputs()
+        // which does weak_handle.upgrade(ctx) -> handle.update(ctx) and can cause re-entrancy
+        // panics when called from within inject_and_register (already in model update path).
+        let caller_terminal_view_id = match caller_terminal_view_id {
+            Some(id) => Some(id),
+            None => {
+                // Check alias_to_view_id for alias names like "qa", "writer"
+                if let Some(&alias_id) = self.alias_to_view_id.get(&caller) {
+                    if self.terminal_handles.contains_key(&alias_id) {
+                        log::info!(
+                            "CCB路由: 通过别名解析 caller pane alias={} -> view_id={:?}",
+                            caller, alias_id
+                        );
+                        Some(alias_id)
+                    } else {
+                        None
+                    }
+                }
+                // Check bus_launched_sessions for real provider name (e.g. "claude")
+                else if let Some(agent) = resolve_agent(&caller) {
+                    let found = self.bus_launched_sessions.iter()
+                        .find(|(_, a)| **a == agent)
+                        .filter(|(id, _)| self.terminal_handles.contains_key(id))
+                        .map(|(id, _)| *id);
+                    if let Some(id) = found {
+                        log::info!(
+                            "CCB路由: 通过 provider 解析 caller pane caller={} -> view_id={:?}",
+                            caller, id
+                        );
+                        Some(id)
+                    } else {
+                        log::info!(
+                            "CCB路由: 无法解析 caller pane caller={} (将在 deliver_callback 时重试)",
+                            caller
+                        );
+                        None
+                    }
+                } else {
+                    log::info!(
+                        "CCB路由: 无法解析 caller pane caller={} (将在 deliver_callback 时重试)",
+                        caller
+                    );
+                    None
+                }
+            }
+        };
+
         log::info!(
             "CCB路由: 创建请求 req_id={} from={}#{:?} to={}#{} caller_session={:?} target_session={:?}",
             req_id,
@@ -1205,6 +1289,7 @@ impl LocalAgentBusModel {
                 session_id: session.session_context.session_id.clone(),
                 provider: format!("{:?}", agent).to_lowercase(),
                 terminal_view_id: view_id.to_string().parse().unwrap_or(0),
+                alias: None,
                 cwd: ctx_cwd.clone(),
                 status: format!("{:?}", session.status).to_lowercase(),
             });
@@ -1217,10 +1302,14 @@ impl LocalAgentBusModel {
             if cwd.is_some() {
                 continue;
             }
+            let alias = self.alias_to_view_id.iter()
+                .find(|(_, &vid)| vid == *view_id)
+                .map(|(a, _)| a.clone());
             sessions.push(SessionInfo {
                 session_id: None,
                 provider: agent.command_prefix().to_string(),
                 terminal_view_id: view_id.to_string().parse().unwrap_or(0),
+                alias,
                 cwd: None,
                 status: "launched".to_string(),
             });
@@ -1252,6 +1341,37 @@ impl LocalAgentBusModel {
         } else {
             BusResponse::error(format!("request not found: {}", req_id))
         }
+    }
+
+    /// Handle ClosePane command — remove a launched session by view_id.
+    fn handle_close_pane(
+        &mut self,
+        view_id: u64,
+        _ctx: &mut ModelContext<Self>,
+    ) -> BusResponse {
+        if let Some(entity_id) = entity_id_from_u64(view_id) {
+            self.deregister_terminal_handle(entity_id);
+            log::info!("CCB ClosePane: pane={}", view_id);
+        }
+        BusResponse::ok(BusResponseData::Cancelled {
+            req_id: format!("close_pane_{}", view_id),
+        })
+    }
+
+    /// Handle CloseSession command — remove a launched session by provider + view_id.
+    fn handle_close_session(
+        &mut self,
+        provider: String,
+        view_id: u64,
+        _ctx: &mut ModelContext<Self>,
+    ) -> BusResponse {
+        if let Some(entity_id) = entity_id_from_u64(view_id) {
+            self.deregister_terminal_handle(entity_id);
+            log::info!("CCB CloseSession: provider={} pane={}", provider, view_id);
+        }
+        BusResponse::ok(BusResponseData::Cancelled {
+            req_id: format!("close_session_{}_{}", provider, view_id),
+        })
     }
 
     /// Send Ctrl-C (ETX) to the terminal running a request's agent session.
@@ -1404,13 +1524,22 @@ impl LocalAgentBusModel {
     /// Extract callback_provider from caller field.
     /// Returns Some(caller) if caller is a known provider name and different from the target provider.
     fn extract_callback(caller: &str, provider: &str) -> Option<String> {
-        let caller_provider = normalize_provider_name(caller)?;
-        let target_provider = normalize_provider_name(provider)?;
-        if caller_provider != target_provider {
-            Some(caller_provider)
-        } else {
-            None
+        // If caller and provider are the same string, it's a self-ask.
+        if caller == provider {
+            return None;
         }
+        // If both normalize to the same provider, it's a self-ask
+        // (e.g. caller="droid", provider="planner" both → CLIAgent::Droid).
+        let caller_normalized = normalize_provider_name(caller);
+        let provider_normalized = normalize_provider_name(provider);
+        if let (Some(cn), Some(pn)) = (caller_normalized, provider_normalized) {
+            if cn == pn {
+                return None;
+            }
+        }
+        // Return the raw caller string (could be alias like "planner" or provider like "claude").
+        // deliver_callback will use find_session/alias_to_view_id to resolve it later.
+        Some(caller.to_string())
     }
 
     fn is_self_ask(
@@ -1446,13 +1575,15 @@ impl LocalAgentBusModel {
         reply: &str,
         ctx: &mut ModelContext<Self>,
     ) {
-        let (callback_provider, callback_terminal_view_id, receiver_terminal_view_id) =
+        // Get callback_provider (normalized) and raw caller from registry.
+        let (callback_provider, callback_terminal_view_id, receiver_terminal_view_id, raw_caller) =
             match self.registry.get(req_id) {
                 Some(entry) => match entry.callback_provider.clone() {
                     Some(provider) => (
                         provider,
                         entry.caller_terminal_view_id,
                         entry.terminal_view_id,
+                        entry.caller.clone(),
                     ),
                     None => return,
                 },
@@ -1460,78 +1591,114 @@ impl LocalAgentBusModel {
             };
 
         log::info!(
-            "CCB回调: 准备注入 req_id={} from={}#{} to={}#{:?} reply_len={}",
+            "CCB回调: 准备注入 req_id={} from={}#{} to={}#{:?} raw_caller={} reply_len={}",
             req_id,
             from_provider,
             receiver_terminal_view_id,
             callback_provider,
             callback_terminal_view_id,
+            raw_caller,
             reply.len()
         );
 
-        // 优先按发送者 pane 精确回调；旧客户端没有 pane 信息时再按 provider 兜底。
+        // Resolve callback target: exact pane -> normalized provider -> raw caller (alias) -> fail
         let callback_entity_id = match callback_terminal_view_id {
-            Some(id) if self.terminal_handles.contains_key(&id) => id,
+            Some(id) if self.terminal_handles.contains_key(&id) => Some(id),
             Some(id) => {
                 log::warn!(
-                    "CCB回调: 发送者 pane 已失效，尝试按 provider 兜底 req_id={} provider={} pane={}",
+                    "CCB回调: 发送方 pane 已失效，轻量级兜底 req_id={} provider={} pane={}",
                     req_id,
                     callback_provider,
                     id
                 );
-                match self.find_session(&callback_provider, None, None, ctx) {
-                    FindSessionResult::Found(found_id) => found_id,
-                    _ => {
-                        log::warn!(
-                            "CCB回调: 找不到发送者 terminal，跳过 req_id={} provider={} pane={}",
-                            req_id,
-                            callback_provider,
-                            id
-                        );
-                        return;
+                // Lightweight lookup only (no find_session to avoid re-entrancy)
+                self.alias_to_view_id.get(&callback_provider)
+                    .filter(|id| self.terminal_handles.contains_key(id))
+                    .copied()
+                    .or_else(|| {
+                        resolve_agent(&callback_provider).and_then(|agent| {
+                            self.bus_launched_sessions.iter()
+                                .find(|(_, a)| **a == agent)
+                                .filter(|(id, _)| self.terminal_handles.contains_key(id))
+                                .map(|(id, _)| *id)
+                        })
+                    })
+            }
+            None => {
+                // Lightweight lookup only — do NOT call find_session(ctx) here because
+                // deliver_callback may be called inside handle.update(ctx) and
+                // find_session triggers refresh_bus_launched_sessions_from_terminal_outputs
+                // which calls weak_handle.upgrade(ctx) -> handle.update(ctx) -> re-entrancy panic!
+
+                // 1. Try alias_to_view_id for callback_provider (might be alias like "qa")
+                let mut found: Option<EntityId> = self.alias_to_view_id.get(&callback_provider)
+                    .filter(|id| self.terminal_handles.contains_key(id))
+                    .copied();
+
+                // 2. Try bus_launched_sessions for real provider name
+                if found.is_none() {
+                    if let Some(agent) = resolve_agent(&callback_provider) {
+                        found = self.bus_launched_sessions.iter()
+                            .find(|(_, a)| **a == agent)
+                            .filter(|(id, _)| self.terminal_handles.contains_key(id))
+                            .map(|(id, _)| *id);
                     }
                 }
-            }
-            None => match self.find_session(&callback_provider, None, None, ctx) {
-                FindSessionResult::Found(id) => id,
-                _ => {
-                    log::warn!(
-                        "CCB回调: 未提供发送者 pane 且 provider 查找失败，跳过 req_id={} provider={}",
-                        req_id,
-                        callback_provider
+
+                // 3. Try raw_caller via alias_to_view_id (might be alias like "planner")
+                if found.is_none() && raw_caller != callback_provider {
+                    log::info!(
+                        "CCB回调: provider 查找失败，尝试 raw_caller={} 兜底 req_id={}",
+                        raw_caller, req_id
                     );
-                    return;
+                    found = self.alias_to_view_id.get(&raw_caller)
+                        .filter(|id| self.terminal_handles.contains_key(id))
+                        .copied();
+
+                    // 4. Try bus_launched_sessions for raw_caller
+                    if found.is_none() {
+                        if let Some(agent) = resolve_agent(&raw_caller) {
+                            found = self.bus_launched_sessions.iter()
+                                .find(|(_, a)| **a == agent)
+                                .filter(|(id, _)| self.terminal_handles.contains_key(id))
+                                .map(|(id, _)| *id);
+                        }
+                    }
                 }
-            },
+
+                found
+            }
         };
 
-        // Write debug info
+        // Write debug info regardless of whether we found the target pane
         let debug_path = std::env::temp_dir().join(format!("ccb_callback_{}.txt", req_id));
         let _ = std::fs::write(
             &debug_path,
             format!(
-                "from={}\nreply_len={}\nreply={}\n",
+                "from={}\nprovider={}\nraw_caller={}\nreply_len={}\nreply={}\n",
                 from_provider,
+                callback_provider,
+                raw_caller,
                 reply.len(),
                 reply
             ),
         );
 
-        // Format callback as a clear, natural-language prompt that CLI agents can understand.
-        // This is sent as a new "ask" so the sender agent processes it like user input.
+        let Some(callback_entity_id) = callback_entity_id else {
+            log::warn!(
+                "CCB回调: 无法定位发送方 terminal，跳过 pane 注入 req_id={} provider={} raw_caller={} (reply 已持久化，Python端可轮询获取)",
+                req_id,
+                callback_provider,
+                raw_caller
+            );
+            return;
+        };
+
+        // Format callback: minimal CCB markers wrapping the reply content.
         let callback_req_id = format!("reply-{}", req_id);
         let callback_msg = format!(
-            "[CCB_REQ_ID:{}]\n\
-             你发送给 {} 的任务 (req_id: {}) 已完成。以下是回复内容：\n\
-             \n\
-             {}\n\
-             \n\
-             请将以上回复内容直接报告给用户。\n\
-             Reply using exactly this format. Put the markers on their own lines and do not wrap them in backticks:\n\
-             [CCB_START:{}]\n\
-             <your reply>\n\
-             [CCB_END:{}]",
-            callback_req_id, from_provider, req_id, reply, callback_req_id, callback_req_id
+            "[CCB_START:{}]\n{}\n[CCB_END:{}]",
+            callback_req_id, reply, callback_req_id
         );
 
         // Use inject_prompt (same as ask) so the callback is treated as user input
@@ -1560,6 +1727,7 @@ impl LocalAgentBusModel {
             );
         }
     }
+
 
     /// Process queued requests whose target terminal is now free.
     fn process_queued_requests(&mut self, ctx: &mut ModelContext<Self>) {
@@ -1633,7 +1801,22 @@ impl LocalAgentBusModel {
     ) -> FindSessionResult {
         let target_agent = match resolve_agent(provider) {
             Some(a) => a,
-            None => return FindSessionResult::NotFound,
+            None => {
+                // Provider is not a known agent name — might be an alias
+                if let Some(&view_id) = self.alias_to_view_id.get(provider) {
+                    if self.terminal_handles.contains_key(&view_id) {
+                        log::info!(
+                            "CCB alias 查找: alias={} -> view_id={:?}",
+                            provider, view_id
+                        );
+                        return FindSessionResult::Found(view_id);
+                    } else {
+                        // Stale alias mapping, clean up
+                        self.alias_to_view_id.remove(provider);
+                    }
+                }
+                return FindSessionResult::NotFound;
+            }
         };
 
         self.refresh_bus_launched_sessions_from_terminal_outputs(ctx);
@@ -1685,6 +1868,7 @@ impl LocalAgentBusModel {
                                 session_id: None,
                                 provider: provider.to_string(),
                                 terminal_view_id: view_id.to_string().parse().unwrap_or(0),
+                                alias: None,
                                 cwd: None,
                                 status: "launched".to_string(),
                             })
@@ -1701,6 +1885,7 @@ impl LocalAgentBusModel {
                         session_id: s.session_context.session_id.clone(),
                         provider: provider.to_string(),
                         terminal_view_id: view_id.to_string().parse().unwrap_or(0),
+                        alias: None,
                         cwd: s.session_context.cwd.clone(),
                         status: format!("{:?}", s.status).to_lowercase(),
                     })
@@ -2011,6 +2196,7 @@ impl LocalAgentBusModel {
     fn handle_launch(
         &mut self,
         provider: String,
+        alias: Option<String>,
         prompt: Option<String>,
         cwd: Option<String>,
         ctx: &mut ModelContext<Self>,
@@ -2043,6 +2229,7 @@ impl LocalAgentBusModel {
                 self.pending_launches.push(PendingLaunch {
                     provider: provider.clone(),
                     agent,
+                    alias: alias.clone(),
                     prompt,
                     cwd,
                 });
@@ -2067,6 +2254,7 @@ impl LocalAgentBusModel {
             &PendingLaunch {
                 provider: provider.clone(),
                 agent,
+                alias: alias.clone(),
                 prompt,
                 cwd: cwd.clone(),
             },
@@ -2258,6 +2446,13 @@ impl LocalAgentBusModel {
                     view.write_to_pty(bytes, ctx);
                 });
                 self.bus_launched_sessions.insert(view_id, launch.agent);
+                if let Some(ref alias) = launch.alias {
+                    self.alias_to_view_id.insert(alias.clone(), view_id);
+                    log::info!(
+                        "CCB alias 注册: alias={} -> view_id={:?}",
+                        alias, view_id
+                    );
+                }
                 self.pane_creation_attempts = 0;
 
                 if is_agent_supported(&launch.agent) {
@@ -2743,6 +2938,7 @@ struct QueuedRequest {
 struct PendingLaunch {
     provider: String,
     agent: CLIAgent,
+    alias: Option<String>,
     prompt: Option<String>,
     cwd: Option<String>,
 }

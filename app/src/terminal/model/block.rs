@@ -1608,6 +1608,19 @@ impl Block {
             }));
     }
 
+    /// Dismiss the bootstrap spinner/banner without finishing the output grid and
+    /// without sending BlockCompleted (which would advance the block list and lose
+    /// the agent's output).  Used when a CLI agent is injected into a new pane
+    /// before the shell finishes bootstrapping — the spinner would otherwise stay
+    /// stuck forever because the agent takes over before the shell prompt appears.
+    pub fn dismiss_bootstrap(&mut self) {
+        self.header_grid.finish_command(self.bootstrap_stage);
+        self.block_banner = None;
+        // Do NOT: finish output_grid, set completed_ts, change state, or send events.
+        // Those would advance the block list and the active block would no longer
+        // contain the CLI agent's output, breaking session detection.
+    }
+
     pub fn num_secrets_obfuscated(&self) -> usize {
         self.header_grid.num_secrets_obfuscated() + self.output_grid.num_secrets_obfuscated()
     }

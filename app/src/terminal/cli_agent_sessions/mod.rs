@@ -45,6 +45,7 @@ pub struct CLIAgentSessionContext {
     pub summary: Option<String>,
     pub query: Option<String>,
     pub response: Option<String>,
+    pub alias: Option<String>,
 }
 
 /// State of the rich input editor for composing a prompt to send to a CLI agent.
