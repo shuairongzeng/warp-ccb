@@ -225,7 +225,12 @@ class AgentWorker:
         self._cleanup_task(req_id)
 
     def _push_to_caller(self, req_id, content):
-        """Push reply to the caller's pane via TCP inject."""
+        """Notify the caller that a reply is ready (lightweight — no full content inject).
+
+        The reply is already persisted in SQLite. The caller reads it with
+        `warp-pend --req-id {req_id}`.  We only inject a one-line notification
+        so large payloads never flood the PTY.
+        """
         req = self.db.get_request(req_id)
         if not req:
             return
@@ -233,48 +238,40 @@ class AgentWorker:
         if not caller:
             return
 
+        chars = len(content)
         inject_prompt = (
-            f"[CCB_REPLY:req_id={req_id}]\n"
-            f"Reply from {self.agent_name}:\n\n"
-            f"{content}\n"
+            f"[CCB_REPLY_READY:req_id={req_id} from={self.agent_name} chars={chars}]\n"
+            f"Query: warp-pend --req-id {req_id}\n"
         )
 
         try:
             from bus_client import ask as tcp_ask
             response, _ = tcp_ask(caller, inject_prompt, caller=self.agent_name)
             if response.get("ok"):
-                print(f"[ccb-worker] Pushed reply to {caller} via TCP inject")
+                print(f"[ccb-worker] Notified {caller}: reply ready for {req_id} ({chars} chars)")
             else:
-                print(f"[ccb-worker] TCP inject to {caller} failed: {response.get('message', '?')}")
+                print(f"[ccb-worker] TCP notify to {caller} failed: {response.get('message', '?')}")
         except Exception as e:
-            print(f"[ccb-worker] TCP inject skipped ({e}), reply saved in SQLite")
+            print(f"[ccb-worker] TCP notify skipped ({e}), reply saved in SQLite")
 
     def _handle_reply_ready(self, req_id):
-        """Handle a reply_ready notification — inject the reply into our pane."""
+        """Handle a reply_ready notification — print a lightweight summary.
+
+        The reply is already in SQLite.  We just log a one-liner so the
+        agent knows to query with warp-pend.
+        """
         reply = self.db.get_reply(req_id)
         if not reply:
             return
 
         content = reply.get("content", "")
         from_agent = reply.get("from_agent", "")
-        if not content:
-            return
+        chars = len(content)
 
-        inject_prompt = (
-            f"[CCB_REPLY:req_id={req_id}]\n"
-            f"Reply from {from_agent}:\n\n"
-            f"{content}\n"
+        print(
+            f"[CCB_REPLY_READY:req_id={req_id} from={from_agent} chars={chars}]\n"
+            f"Query: warp-pend --req-id {req_id}"
         )
-
-        try:
-            from bus_client import ask as tcp_ask
-            response, _ = tcp_ask(self.agent_name, inject_prompt, caller=from_agent)
-            if response.get("ok"):
-                print(f"[ccb-worker] Pushed reply for {req_id} from {from_agent} into pane")
-            else:
-                print(f"[ccb-worker] Pane inject failed for {req_id}: {response.get('message', '?')}")
-        except Exception as e:
-            print(f"[ccb-worker] Pane inject skipped ({e}), reply available in SQLite")
 
     def _cleanup_task(self, req_id):
         """Remove task and reply files."""

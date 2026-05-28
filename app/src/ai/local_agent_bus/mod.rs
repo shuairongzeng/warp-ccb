@@ -1670,20 +1670,7 @@ impl LocalAgentBusModel {
             }
         };
 
-        // Write debug info regardless of whether we found the target pane
-        let debug_path = std::env::temp_dir().join(format!("ccb_callback_{}.txt", req_id));
-        let _ = std::fs::write(
-            &debug_path,
-            format!(
-                "from={}\nprovider={}\nraw_caller={}\nreply_len={}\nreply={}\n",
-                from_provider,
-                callback_provider,
-                raw_caller,
-                reply.len(),
-                reply
-            ),
-        );
-
+        // Debug file is written below (after resolving callback_entity_id).
         let Some(callback_entity_id) = callback_entity_id else {
             log::warn!(
                 "CCB回调: 无法定位发送方 terminal，跳过 pane 注入 req_id={} provider={} raw_caller={} (reply 已持久化，Python端可轮询获取)",
@@ -1693,16 +1680,31 @@ impl LocalAgentBusModel {
             );
             return;
         };
-
-        // Format callback: minimal CCB markers wrapping the reply content.
+        // Inject a lightweight notification instead of the full reply content.
+        // The reply is already persisted in SQLite (via bus_sqlite.reply()).
+        // The caller reads it with `warp-pend --req-id {req_id}` on demand,
+        // which avoids flooding the PTY with potentially huge payloads.
         let callback_req_id = format!("reply-{}", req_id);
+        let reply_len = reply.len();
         let callback_msg = format!(
-            "[CCB_START:{}]\n{}\n[CCB_END:{}]",
-            callback_req_id, reply, callback_req_id
+            "[CCB_REPLY_READY:req_id={} from={} chars={}]\nQuery: warp-pend --req-id {}",
+            req_id, from_provider, reply_len, req_id
         );
 
-        // Use inject_prompt (same as ask) so the callback is treated as user input
-        // and processed by the CLI agent naturally.
+        // Still write full reply to debug file for diagnostics.
+        let debug_path = std::env::temp_dir().join(format!("ccb_callback_{}.txt", req_id));
+        let _ = std::fs::write(
+            &debug_path,
+            format!(
+                "from={}\nprovider={}\nraw_caller={}\nreply_len={}\nreply={}\n",
+                from_provider,
+                callback_provider,
+                raw_caller,
+                reply_len,
+                reply
+            ),
+        );
+
         let injected = self.inject_prompt(
             callback_entity_id,
             &callback_provider,
@@ -1712,11 +1714,11 @@ impl LocalAgentBusModel {
         );
         if injected {
             log::info!(
-                "CCB回调: 已注入 req_id={} to={}#{} reply_len={}",
+                "CCB回调: 已注入轻量通知 req_id={} to={}#{} reply_len={} (完整内容在SQLite)",
                 req_id,
                 callback_provider,
                 callback_entity_id,
-                reply.len()
+                reply_len
             );
         } else {
             log::warn!(
