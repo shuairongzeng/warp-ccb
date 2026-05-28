@@ -13,7 +13,11 @@ import json
 
 if sys.stdout and hasattr(sys.stdout, 'reconfigure'):
     try:
-        sys.stdout.reconfigure(errors='replace')
+        # Detect PTY codepage: Warp PTY on Chinese Windows uses GBK (936).
+        # Python must match the PTY encoding so characters display correctly.
+        import locale
+        enc = locale.getpreferredencoding() or 'utf-8'
+        sys.stdout.reconfigure(encoding=enc, errors='replace')
     except Exception:
         pass
 
@@ -81,8 +85,17 @@ def main():
                     status = reply.get("status", "unknown")
                     content = reply.get("content", "")
                     if content:
-                        print(f"[{req_id}] ({status})")
-                        print(content)
+                        # Encode to system codepage for PTY, replace unencodable chars
+                        import locale as _loc
+                        _enc = _loc.getpreferredencoding() or 'utf-8'
+                        try:
+                            sys.stdout.buffer.write(f"[{req_id}] ({status})\n".encode(_enc, errors='replace'))
+                            sys.stdout.buffer.write(content.encode(_enc, errors='replace'))
+                            sys.stdout.buffer.write(b"\n")
+                            sys.stdout.buffer.flush()
+                        except Exception:
+                            print(f"[{req_id}] ({status})")
+                            print(content)
                     else:
                         print(f"[{req_id}] ({status}) <empty reply>")
                 else:
