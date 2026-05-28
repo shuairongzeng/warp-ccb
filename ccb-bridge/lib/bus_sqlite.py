@@ -226,6 +226,12 @@ class BusDB:
         now = _now()
         content = prompt
 
+        # Sanitize content: remove lone surrogates that break SQLite UTF-8 encoding.
+        try:
+            content.encode("utf-8")
+        except UnicodeEncodeError:
+            content = content.encode("utf-8", errors="surrogatepass").decode("utf-8", errors="replace")
+
         with self._conn:
             self._conn.execute(
                 """INSERT INTO bus_messages
@@ -249,6 +255,14 @@ class BusDB:
         """Submit a reply for a pending request."""
         caller = caller or _detect_caller()
         now = _now()
+
+        # Sanitize content: remove lone surrogates that break SQLite UTF-8 encoding.
+        # Terminal output on Windows may contain stray surrogates from emoji or
+        # CJK fallback rendering.
+        try:
+            content.encode("utf-8")
+        except UnicodeEncodeError:
+            content = content.encode("utf-8", errors="surrogatepass").decode("utf-8", errors="replace")
 
         # Find the original ask to determine the target (from_agent)
         row = self._conn.execute(
