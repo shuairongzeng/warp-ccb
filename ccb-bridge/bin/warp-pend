@@ -68,6 +68,15 @@ def main():
             # queries by req_id alone — no to_agent filter needed.
             if req_id and not provider:
                 reply = db.get_reply(req_id)
+                # Debug: log to ccb.log for troubleshooting
+                try:
+                    import time as _t
+                    _lp = os.path.join(os.path.expanduser("~"), ".warp-ccb", "logs", "ccb.log")
+                    os.makedirs(os.path.dirname(_lp), exist_ok=True)
+                    with open(_lp, "a", encoding="utf-8") as _f:
+                        _f.write(f"[{_t.strftime('%Y-%m-%d %H:%M:%S')}] [warp-pend] req-id-only query: req_id={req_id} db={db.db_path} found={reply is not None}\n")
+                except Exception:
+                    pass
                 if reply:
                     status = reply.get("status", "unknown")
                     content = reply.get("content", "")

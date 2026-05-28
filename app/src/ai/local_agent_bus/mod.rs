@@ -1681,11 +1681,32 @@ impl LocalAgentBusModel {
             return;
         };
         // Inject a lightweight notification instead of the full reply content.
-        // The reply is already persisted in SQLite (via bus_sqlite.reply()).
-        // The caller reads it with `warp-pend --req-id {req_id}` on demand,
-        // which avoids flooding the PTY with potentially huge payloads.
+        // The reply is persisted to SQLite by the Python bus_sqlite.reply() call.
+        // However, for the Rust passive-capture path (agents using [CCB_START/END]
+        // markers without ccb-worker), the reply is NOT in SQLite yet.
+        // Sync it now via a Python one-liner so warp-pend can find it.
         let callback_req_id = format!("reply-{}", req_id);
         let reply_len = reply.len();
+
+        // Sync reply to SQLite so warp-pend can find it.
+        // For the Python/ccb-worker path, reply is already in SQLite.
+        // For the Rust passive-capture path ([CCB_START/END] markers), it is NOT.
+        // We write the reply to a temp file and call warp-reply --mode sqlite.
+        let tmp_dir = std::env::temp_dir().join("ccb-sync");
+        let _ = std::fs::create_dir_all(&tmp_dir);
+        let content_file = tmp_dir.join(format!("{}.txt", req_id));
+        if std::fs::write(&content_file, reply.as_bytes()).is_ok() {
+            let _ = std::process::Command::new("warp-reply")
+                .args(&[
+                    "--req-id", req_id,
+                    "--content-file", content_file.to_str().unwrap_or(""),
+                    "--caller", &callback_provider,
+                    "--mode", "sqlite",
+                ])
+                .output();
+            let _ = std::fs::remove_file(&content_file);
+        }
+
         let callback_msg = format!(
             "[CCB_REPLY_READY:req_id={} from={} chars={}]\nQuery: warp-pend --req-id {}",
             req_id, from_provider, reply_len, req_id
@@ -1704,7 +1725,6 @@ impl LocalAgentBusModel {
                 reply
             ),
         );
-
         let injected = self.inject_prompt(
             callback_entity_id,
             &callback_provider,
