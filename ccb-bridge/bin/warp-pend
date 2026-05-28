@@ -22,17 +22,18 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "lib"))
 
 def main():
     if len(sys.argv) < 2:
-        print("Usage: warp-pend <provider> [--count N] [--req-id <id>] [--cwd <dir>] [--mode <tcp|sqlite|dual>]")
-        print("Providers: claude, codex, gemini, opencode, droid, kimi, goose")
+        print("Usage:")
+        print("  warp-pend <provider> [--count N] [--req-id <id>] [--mode <sqlite|tcp|dual>]")
+        print("  warp-pend --req-id <id>                   # query by req-id alone (no provider needed)")
         sys.exit(1)
 
-    provider = sys.argv[1]
+    provider = None
     count = 1
     req_id = None
     cwd = None
     mode = "sqlite"
 
-    i = 2
+    i = 1
     while i < len(sys.argv):
         if sys.argv[i] == "--count" and i + 1 < len(sys.argv):
             count = int(sys.argv[i + 1])
@@ -46,6 +47,9 @@ def main():
         elif sys.argv[i] == "--mode" and i + 1 < len(sys.argv):
             mode = sys.argv[i + 1]
             i += 2
+        elif not sys.argv[i].startswith("-"):
+            provider = sys.argv[i]
+            i += 1
         else:
             i += 1
 
@@ -59,6 +63,28 @@ def main():
                 db.sync_from_tcp()
             except Exception:
                 pass
+
+            # If req_id is given without provider, use get_reply() which
+            # queries by req_id alone — no to_agent filter needed.
+            if req_id and not provider:
+                reply = db.get_reply(req_id)
+                if reply:
+                    status = reply.get("status", "unknown")
+                    content = reply.get("content", "")
+                    if content:
+                        print(f"[{req_id}] ({status})")
+                        print(content)
+                    else:
+                        print(f"[{req_id}] ({status}) <empty reply>")
+                else:
+                    print(f"No reply found for req_id={req_id}")
+                db.close()
+                return
+
+            if not provider:
+                print("Error: provider is required when --req-id is not specified", file=sys.stderr)
+                sys.exit(1)
+
             replies = db.pend(provider, count=count, req_id=req_id)
             # Consume ONLY reply_ready notifications so they don't pile up.
             # Must NOT touch new_request notifs — those belong to ccb-worker.
