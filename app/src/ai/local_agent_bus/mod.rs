@@ -3365,6 +3365,7 @@ fn clean_passive_output(raw_output: &str, provider: &str) -> (String, Vec<String
         "kimi" => clean_kimi_chrome(&compressed, &mut warnings),
         "codex" => clean_codex_chrome(&compressed),
         "droid" => clean_droid_chrome(&compressed),
+        "planner" | "glm" => clean_glm_chrome(&compressed),
         _ => compressed,
     };
 
@@ -3427,6 +3428,54 @@ fn clean_codex_chrome(text: &str) -> String {
 /// Droid-specific chrome removal. Currently a no-op; add patterns as needed.
 fn clean_droid_chrome(text: &str) -> String {
     text.to_string()
+}
+fn clean_glm_chrome(text: &str) -> String {
+    // Filter out GLM CLI UI refresh frames that repeat in terminal output.
+    let chrome_markers: &[&str] = &[
+        "Streaming...",
+        "Press ESC to stop",
+        "Enter to steer",
+        "Downloading update",
+        "MCP",
+        "for help",
+        "? for help",
+        "GLM-",
+    ];
+    let mut result = Vec::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            result.push(line);
+            continue;
+        }
+        let is_chrome = chrome_markers.iter().any(|p| trimmed.contains(p))
+            || trimmed.starts_with('⣀') || trimmed.starts_with('⣁')
+            || trimmed.starts_with('⣂') || trimmed.starts_with('⣃')
+            || trimmed.starts_with('⣄') || trimmed.starts_with('⣅')
+            || trimmed.starts_with('⣆') || trimmed.starts_with('⣇')
+            || trimmed.starts_with('⠁') || trimmed.starts_with('⠉')
+            || trimmed.starts_with('⠋') || trimmed.starts_with('⠙')
+            || trimmed.starts_with('⠚') || trimmed.starts_with('⠞')
+            || trimmed.starts_with('⠿')
+            || (trimmed.starts_with('[') && trimmed.contains("s]"))
+            || (trimmed.starts_with('>') && trimmed.len() < 20);
+        if !is_chrome {
+            result.push(line);
+        }
+    }
+    // Deduplicate consecutive repeated lines
+    let mut deduped: Vec<&str> = Vec::new();
+    let mut prev: Option<&str> = None;
+    for line in &result {
+        if let Some(p) = prev {
+            if line.trim() == p.trim() && !p.trim().is_empty() {
+                continue;
+            }
+        }
+        deduped.push(*line);
+        prev = Some(line.trim());
+    }
+    deduped.join("\n")
 }
 
 /// Build a passive capture candidate from raw/grid output when all marker strategies failed.
@@ -3732,10 +3781,95 @@ fn extract_reply(req_id: &str, output: &str) -> String {
         }
     }
 
+    // Strategy 4: START found but END missing (agent interrupted or CCB_END never output).
+    // Use find_unwrapped_ccb_tag_ranges to locate the last START (handles line-wrapped markers),
+    // then extract content after it. Filter known UI chrome patterns from CLI tools.
+    {
+        for marker_id in &marker_ids {
+            let start_ranges = completion::find_unwrapped_ccb_tag_ranges(output, "CCB_START", marker_id);
+            if let Some(&(_tag_start, content_start)) = start_ranges.last() {
+                let after = &output[content_start..];
+                // Collect lines, filtering out CLI UI chrome (repeated status bars, prompts, etc.)
+                let reply = extract_reply_from_unclosed_start(after);
+                if !reply.is_empty() {
+                    log::info!(
+                        "CCB_DEBUG: Strategy 4 extracted {} chars from unclosed START marker_id={}",
+                        reply.len(),
+                        marker_id
+                    );
+                    return reply;
+                }
+            }
+        }
+    }
+
     log::info!("CCB_DEBUG: no reply extracted, returning empty");
     String::new()
 }
+fn extract_reply_from_unclosed_start(text: &str) -> String {
+    // Known CLI UI chrome patterns to filter out.
+    let chrome_patterns: &[&str] = &[
+        "Streaming...",
+        "Press ESC to stop",
+        "Enter to steer",
+        "Downloading update",
+        "MCP",
+        "for help",
+        "? for help",
+    ];
 
+    let mut seen_lines: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut content_lines: Vec<String> = Vec::new();
+    let mut consecutive_chrome = 0usize;
+
+    for line in text.lines() {
+        let trimmed = line.trim();
+
+        // Skip empty lines (but allow a few between content)
+        if trimmed.is_empty() {
+            if consecutive_chrome < 3 && !content_lines.is_empty() {
+                content_lines.push(String::new());
+            }
+            continue;
+        }
+
+        // Check if this line is UI chrome
+        let is_chrome = chrome_patterns.iter().any(|p| trimmed.contains(p))
+            || trimmed.starts_with('⣀') || trimmed.starts_with('⣁')
+            || trimmed.starts_with('⣂') || trimmed.starts_with('⣃')
+            || trimmed.starts_with('⣄') || trimmed.starts_with('⣅')
+            || trimmed.starts_with('⣆') || trimmed.starts_with('⣇')
+            || trimmed.starts_with('⠁') || trimmed.starts_with('⠉')
+            || trimmed.starts_with('⠋') || trimmed.starts_with('⠙')
+            || trimmed.starts_with('⠚') || trimmed.starts_with('⠞')
+            || trimmed.starts_with('⠿')
+            || (trimmed.starts_with('[') && trimmed.contains("s]"))
+            || (trimmed.starts_with('>') && trimmed.len() < 20);
+
+        // Check if this is a repeated line (UI frame duplication)
+        let is_duplicate = !seen_lines.insert(trimmed.to_string()) && trimmed.len() > 10;
+
+        if is_chrome || is_duplicate {
+            consecutive_chrome += 1;
+            // If we see 3+ consecutive chrome/duplicate lines, stop collecting.
+            if consecutive_chrome >= 3 && !content_lines.is_empty() {
+                break;
+            }
+            continue;
+        }
+
+        // Reset chrome counter on content line
+        consecutive_chrome = 0;
+        content_lines.push(trimmed.to_string());
+    }
+
+    let result = content_lines.join("\n").trim().to_string();
+    if result.len() >= 2 && result.chars().filter(|c| !c.is_whitespace()).count() >= 2 {
+        result
+    } else {
+        String::new()
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;

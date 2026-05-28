@@ -1,33 +1,43 @@
-#!/usr/bin/env python3
-"""warp-pend — View latest replies from a CLI agent via Warp LocalAgentBus"""
+#!/usr/bin/env python
+"""warp-pend — View latest replies from a CLI agent
+
+Supports two modes:
+  --mode tcp     : Use TCP JSONL bus (original)
+  --mode sqlite  : Use SQLite bus (default)
+  --mode dual    : Try SQLite first
+"""
 
 import sys
 import os
 import json
 
-# Fix Windows console encoding for Unicode output
 if sys.stdout and hasattr(sys.stdout, 'reconfigure'):
     try:
-        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+        # Detect PTY codepage: Warp PTY on Chinese Windows uses GBK (936).
+        # Python must match the PTY encoding so characters display correctly.
+        import locale
+        enc = locale.getpreferredencoding() or 'utf-8'
+        sys.stdout.reconfigure(encoding=enc, errors='replace')
     except Exception:
         pass
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "lib"))
-from bus_client import pend
 
 
 def main():
     if len(sys.argv) < 2:
-        print("Usage: warp-pend <provider> [--count N] [--req-id <id>] [--cwd <dir>]")
-        print("Providers: claude, codex, gemini, opencode, droid")
+        print("Usage:")
+        print("  warp-pend <provider> [--count N] [--req-id <id>] [--mode <sqlite|tcp|dual>]")
+        print("  warp-pend --req-id <id>                   # query by req-id alone (no provider needed)")
         sys.exit(1)
 
-    provider = sys.argv[1]
+    provider = None
     count = 1
     req_id = None
     cwd = None
+    mode = "sqlite"
 
-    i = 2
+    i = 1
     while i < len(sys.argv):
         if sys.argv[i] == "--count" and i + 1 < len(sys.argv):
             count = int(sys.argv[i + 1])
@@ -38,22 +48,106 @@ def main():
         elif sys.argv[i] == "--cwd" and i + 1 < len(sys.argv):
             cwd = sys.argv[i + 1]
             i += 2
+        elif sys.argv[i] == "--mode" and i + 1 < len(sys.argv):
+            mode = sys.argv[i + 1]
+            i += 2
+        elif not sys.argv[i].startswith("-"):
+            provider = sys.argv[i]
+            i += 1
         else:
             i += 1
 
     try:
-        response = pend(provider, count=count, req_id=req_id, cwd=cwd)
-        if response.get("ok"):
-            replies = response.get("replies", [])
+        # --- SQLite path ---
+        if mode in ("sqlite", "dual"):
+            from bus_sqlite import BusDB
+            db = BusDB(cwd=cwd)
+            # Bridge any TCP replies into SQLite before querying
+            try:
+                db.sync_from_tcp()
+            except Exception:
+                pass
+
+            # If req_id is given without provider, use get_reply() which
+            # queries by req_id alone — no to_agent filter needed.
+            if req_id and not provider:
+                reply = db.get_reply(req_id)
+                # Debug: log to ccb.log for troubleshooting
+                try:
+                    import time as _t
+                    _lp = os.path.join(os.path.expanduser("~"), ".warp-ccb", "logs", "ccb.log")
+                    os.makedirs(os.path.dirname(_lp), exist_ok=True)
+                    with open(_lp, "a", encoding="utf-8") as _f:
+                        _f.write(f"[{_t.strftime('%Y-%m-%d %H:%M:%S')}] [warp-pend] req-id-only query: req_id={req_id} db={db.db_path} found={reply is not None}\n")
+                except Exception:
+                    pass
+                if reply:
+                    status = reply.get("status", "unknown")
+                    content = reply.get("content", "")
+                    if content:
+                        # Encode to system codepage for PTY, replace unencodable chars
+                        import locale as _loc
+                        _enc = _loc.getpreferredencoding() or 'utf-8'
+                        try:
+                            sys.stdout.buffer.write(f"[{req_id}] ({status})\n".encode(_enc, errors='replace'))
+                            sys.stdout.buffer.write(content.encode(_enc, errors='replace'))
+                            sys.stdout.buffer.write(b"\n")
+                            sys.stdout.buffer.flush()
+                        except Exception:
+                            print(f"[{req_id}] ({status})")
+                            print(content)
+                    else:
+                        print(f"[{req_id}] ({status}) <empty reply>")
+                else:
+                    print(f"No reply found for req_id={req_id}")
+                db.close()
+                return
+
+            if not provider:
+                print("Error: provider is required when --req-id is not specified", file=sys.stderr)
+                sys.exit(1)
+
+            replies = db.pend(provider, count=count, req_id=req_id)
+            # Consume ONLY reply_ready notifications so they don't pile up.
+            # Must NOT touch new_request notifs — those belong to ccb-worker.
+            try:
+                db.get_notifications(provider, consume=True, notif_type='reply_ready')
+            except Exception:
+                pass
+            db.close()
             if not replies:
-                print(f"No replies from {provider}")
-            for reply in replies:
-                status = reply.get("status", "unknown")
-                content = reply.get("content", "")
-                print(f"[{reply.get('req_id', '?')}] ({status}) {content}")
-        else:
-            print(f"Error: {response.get('message', 'unknown error')}", file=sys.stderr)
-            sys.exit(1)
+                print(f"No replies for {provider}")
+            for r in replies:
+                status = r.get("status", "unknown")
+                content = r.get("content", "")
+                rid = r.get('req_id', '?')
+                if content:
+                    print(f"[{rid}] ({status})")
+                    print(content)
+                else:
+                    print(f"[{rid}] ({status}) <empty reply>")
+            return
+
+        # --- TCP path ---
+        if mode == "tcp":
+            from bus_client import pend
+            response = pend(provider, count=count, req_id=req_id, cwd=cwd)
+            if response.get("ok"):
+                replies = response.get("replies", [])
+                if not replies:
+                    print(f"No replies from {provider}")
+                for reply in replies:
+                    status = reply.get("status", "unknown")
+                    content = reply.get("content", "")
+                    req_id_str = reply.get('req_id', '?')
+                    if content:
+                        print(f"[{req_id_str}] ({status})")
+                        print(content)
+                    else:
+                        print(f"[{req_id_str}] ({status}) <empty reply>")
+            else:
+                print(f"Error: {response.get('message', 'unknown error')}", file=sys.stderr)
+                sys.exit(1)
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
