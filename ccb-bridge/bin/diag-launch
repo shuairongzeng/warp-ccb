@@ -1,0 +1,60 @@
+"""Diagnostic script: test a single launch and report exactly what happens."""
+import sys, os, json, time
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "lib"))
+from bus_client import launch, ping, list_sessions, call_bus
+
+# 1. List current sessions
+print("=== Current sessions ===")
+try:
+    sessions = list_sessions()
+    print(json.dumps(sessions, indent=2))
+except Exception as e:
+    print(f"Error listing sessions: {e}")
+    sys.exit(1)
+
+# 2. Try launching kimi
+print("\n=== Launching kimi ===")
+try:
+    result = launch("kimi", auto_tab=False)
+    print(json.dumps(result, indent=2))
+except Exception as e:
+    print(f"Error launching: {e}")
+    sys.exit(1)
+
+ok = result.get("ok")
+view_id = result.get("terminal_view_id", "?")
+message = result.get("message", "")
+
+print(f"\nok={ok}, view_id={view_id}, message={message}")
+
+if ok and view_id == 0:
+    print("-> Launch returned pending (view_id=0). Pane creation should be in progress.")
+elif ok and view_id != 0:
+    print(f"-> Launch returned immediate success (view_id={view_id})")
+elif not ok:
+    print(f"-> Launch failed: {message}")
+
+# 3. Wait a bit and check sessions again
+print("\n=== Sessions after 3s ===")
+time.sleep(3)
+try:
+    sessions2 = list_sessions()
+    print(json.dumps(sessions2, indent=2))
+except Exception as e:
+    print(f"Error: {e}")
+
+# 4. Ping kimi
+print("\n=== Ping kimi ===")
+try:
+    p = ping("kimi")
+    print(json.dumps(p, indent=2))
+except Exception as e:
+    print(f"Error: {e}")
+
+# 5. Try a raw launch with auto_tab=False to see exact error
+print("\n=== Raw launch test (droid) ===")
+try:
+    raw = call_bus({"type": "launch", "provider": "droid"})
+    print(json.dumps(raw, indent=2))
+except Exception as e:
+    print(f"Error: {e}")

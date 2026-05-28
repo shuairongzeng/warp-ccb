@@ -1,0 +1,101 @@
+#!/usr/bin/env python
+"""warp-ccb-safe — 安全启动多 Agent，自动等待 pane 创建
+
+与 warp-ccb 的区别：
+1. 逐个启动，每个之间等待 pane 创建完成
+2. 如果 launch 返回 pending 状态，主动等待并重试
+3. 超时后优雅降级（跳过而非崩溃）
+"""
+
+import sys
+import os
+import time
+import json
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "lib"))
+from bus_client import launch, list_sessions, pend
+
+VALID_PROVIDERS = {"claude", "codex", "gemini", "opencode", "droid", "copilot", "amp", "kimi", "goose"}
+
+
+def safe_launch(provider, prompt=None, max_retries=5, retry_delay=2.0):
+    """安全启动一个 agent，支持重试和等待 pane 创建。"""
+    for attempt in range(max_retries):
+        try:
+            response = launch(provider, prompt=prompt)
+            
+            # 情况 1: 直接成功
+            if response.get("ok") and response.get("terminal_view_id"):
+                return response
+            
+            # 情况 2: 返回 pending（pane 正在创建）
+            if response.get("ok") and response.get("session_id") is None:
+                print(f"[{provider}] pane creation pending, waiting...")
+                time.sleep(retry_delay)
+                # 再次检查是否有新 session
+                sessions = list_sessions()
+                if sessions.get("ok"):
+                    for s in sessions.get("sessions", []):
+                        if s.get("provider") == provider:
+                            return {"ok": True, "terminal_view_id": s.get("terminal_view_id")}
+                continue
+            
+            # 情况 3: 明确错误
+            if not response.get("ok"):
+                error_msg = response.get("message", "unknown error")
+                # 如果是 "no idle terminal"，等待后重试
+                if "no idle terminal" in error_msg.lower():
+                    print(f"[{provider}] no idle terminal, waiting for pane creation...")
+                    time.sleep(retry_delay)
+                    continue
+                return response
+                
+        except Exception as e:
+            print(f"[{provider}] attempt {attempt + 1}/{max_retries} failed: {e}")
+            time.sleep(retry_delay)
+    
+    return {"ok": False, "message": f"failed after {max_retries} attempts"}
+
+
+def main():
+    if len(sys.argv) < 2:
+        print("Usage: warp-ccb-safe codex,claude,droid [--prompt \"...\"]")
+        sys.exit(1)
+
+    providers = [p.strip().lower() for p in sys.argv[1].split(",")]
+    prompt = None
+    
+    # 解析参数
+    for i, arg in enumerate(sys.argv[2:], 2):
+        if arg in ("-p", "--prompt") and i + 1 < len(sys.argv):
+            prompt = sys.argv[i + 1]
+
+    results = []
+    for provider in providers:
+        print(f"\n[Launching {provider}]...")
+        result = safe_launch(provider, prompt=prompt)
+        
+        if result.get("ok"):
+            tid = result.get("terminal_view_id", "?")
+            print(f"[{provider}] ✓ launched in terminal pane {tid}")
+            results.append({"provider": provider, "status": "launched", "terminal": tid})
+        else:
+            msg = result.get("message", "unknown error")
+            print(f"[{provider}] ✗ failed: {msg}")
+            results.append({"provider": provider, "status": "error", "error": msg})
+        
+        # 每个 agent 启动后等待，让 pane 创建完成
+        time.sleep(2.0)
+
+    # 汇总
+    launched = sum(1 for r in results if r["status"] == "launched")
+    failed = sum(1 for r in results if r["status"] == "error")
+    print(f"\n{'='*40}")
+    print(f"Done: {launched} launched, {failed} failed")
+    for r in results:
+        status_icon = "✓" if r["status"] == "launched" else "✗"
+        print(f"  {status_icon} {r['provider']}: {r.get('terminal', r.get('error', ''))}")
+
+
+if __name__ == "__main__":
+    main()

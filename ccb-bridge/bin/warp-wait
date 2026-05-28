@@ -1,0 +1,126 @@
+#!/usr/bin/env python
+"""warp-wait — Block until a CLI agent request completes
+
+Supports two modes:
+  --mode tcp     : Use TCP JSONL bus (original)
+  --mode sqlite  : Use SQLite bus (default — no Warp dependency)
+  --mode dual    : Try SQLite first, fallback TCP
+"""
+
+import sys
+import os
+
+if sys.stdout and hasattr(sys.stdout, 'reconfigure'):
+    try:
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    except Exception:
+        pass
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "lib"))
+
+
+def main():
+    if len(sys.argv) < 2:
+        print("Usage: warp-wait <req_id> [--timeout N] [--mode <tcp|sqlite|dual>]")
+        print("  Waits for a request to complete, then prints the result.")
+        print("  Default timeout: 86400 seconds (24 hours)")
+        print("  Default mode: sqlite")
+        sys.exit(1)
+
+    req_id = sys.argv[1]
+    timeout = 86400
+    mode = "sqlite"
+
+    i = 2
+    while i < len(sys.argv):
+        if sys.argv[i] == "--timeout" and i + 1 < len(sys.argv):
+            timeout = int(sys.argv[i + 1])
+            i += 2
+        elif sys.argv[i] == "--mode" and i + 1 < len(sys.argv):
+            mode = sys.argv[i + 1]
+            i += 2
+        else:
+            i += 1
+
+    try:
+        result = None
+
+        if mode in ("sqlite", "dual"):
+            from bus_sqlite import BusDB
+            db = BusDB()
+
+            # Use a polling loop that also syncs from TCP on each iteration.
+            # This bridges replies captured by the Rust bus into SQLite.
+            import time as _time
+            deadline = _time.time() + timeout
+            poll_interval = 1.0
+            sync_interval = 3.0  # sync from TCP every 3 seconds
+            last_sync = 0
+            while _time.time() < deadline:
+                # Check SQLite first
+                reply = db.get_reply(req_id)
+                if reply:
+                    ask = db.get_request(req_id)
+                    elapsed_ms = int((reply["done_at"] - ask["created_at"]) * 1000) if ask and reply.get("done_at") else 0
+                    result = {
+                        "ok": True,
+                        "req_id": req_id,
+                        "status": reply["status"],
+                        "content": reply["content"],
+                        "elapsed_ms": elapsed_ms,
+                        "source": reply.get("source"),
+                    }
+                    break
+
+                # Try syncing from TCP periodically
+                now = _time.time()
+                if now - last_sync >= sync_interval:
+                    try:
+                        db.sync_from_tcp()
+                    except Exception:
+                        pass
+                    last_sync = now
+
+                remaining = deadline - _time.time()
+                _time.sleep(min(poll_interval, max(0.1, remaining)))
+
+            if result is None:
+                result = {"ok": False, "message": "timeout"}
+
+            db.close()
+            if not result.get("ok") and mode == "dual":
+                result = None  # fallback to TCP
+
+        if result is None and mode in ("tcp", "dual"):
+            from bus_client import wait
+            response = wait(req_id=req_id, timeout=timeout)
+            if response.get("ok"):
+                data = response
+                status = data.get("status", "unknown")
+                content = data.get("content", "")
+                elapsed = data.get("elapsed_ms", 0)
+                result = {
+                    "ok": True,
+                    "req_id": data.get("req_id", req_id),
+                    "status": status,
+                    "content": content,
+                    "elapsed_ms": elapsed,
+                }
+            else:
+                result = {"ok": False, "message": response.get("message", "unknown error")}
+
+        if result and result.get("ok"):
+            print(f"[{result.get('req_id', req_id)}] ({result.get('status', 'unknown')}) {result.get('elapsed_ms', 0)}ms")
+            if result.get("content"):
+                print(result["content"])
+        else:
+            msg = result.get("message", "unknown error") if result else "no bus available"
+            print(f"Error: {msg}", file=sys.stderr)
+            sys.exit(1)
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

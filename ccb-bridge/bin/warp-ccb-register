@@ -1,0 +1,113 @@
+#!/usr/bin/env python
+"""warp-ccb-register — Register this agent pane in the SQLite bus
+
+Called automatically at agent startup via the launch command wrapper.
+Reads WARP_CCB_PROVIDER and WARP_CCB_TERMINAL_VIEW_ID env vars to identify
+the agent, then registers it in the SQLite bus_agents table.
+
+Usage:
+    warp-ccb-register              # Register with auto-detected identity
+    warp-ccb-register --heartbeat  # Start heartbeat loop (run in background)
+    warp-ccb-register --deregister # Mark this agent as offline
+"""
+
+import os
+import sys
+import time
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "lib"))
+from bus_sqlite import BusDB
+
+
+def get_identity():
+    """Read agent identity from env vars set by the launch wrapper."""
+    provider = os.environ.get("WARP_CCB_PROVIDER", "")
+    view_id_str = os.environ.get("WARP_CCB_TERMINAL_VIEW_ID", "")
+    session_id = os.environ.get("WARP_CCB_SESSION_ID", "")
+    cwd = os.environ.get("WARP_CCB_CWD") or os.getcwd()
+
+    if not provider:
+        return None
+
+    view_id = None
+    if view_id_str:
+        try:
+            view_id = int(view_id_str)
+        except ValueError:
+            pass
+
+    return {
+        "agent_name": provider,
+        "real_provider": provider,
+        "view_id": view_id,
+        "session_id": session_id or None,
+        "cwd": cwd,
+        "pid": os.getpid(),
+    }
+
+
+def register():
+    """Register this agent as online."""
+    identity = get_identity()
+    if not identity:
+        print("Error: WARP_CCB_PROVIDER not set. Not in a CCB agent pane?", file=sys.stderr)
+        sys.exit(1)
+
+    db = BusDB(cwd=identity["cwd"])
+    db.register_agent(**identity)
+    print(f"[CCB_REGISTERED] {identity['agent_name']} (provider={identity['real_provider']}, "
+          f"view_id={identity.get('view_id')}, pid={identity['pid']})")
+    db.close()
+
+
+def heartbeat(interval=30):
+    """Run heartbeat loop. Call with --heartbeat, typically in background."""
+    identity = get_identity()
+    if not identity:
+        print("Error: WARP_CCB_PROVIDER not set", file=sys.stderr)
+        sys.exit(1)
+
+    agent_name = identity["agent_name"]
+    db = BusDB(cwd=identity["cwd"])
+
+    # Register first
+    db.register_agent(**identity)
+
+    try:
+        while True:
+            db.heartbeat(agent_name)
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        db.deregister_agent(agent_name)
+        db.close()
+
+
+def deregister():
+    """Mark this agent as offline."""
+    identity = get_identity()
+    if not identity:
+        sys.exit(0)
+
+    db = BusDB(cwd=identity["cwd"])
+    db.deregister_agent(identity["agent_name"])
+    print(f"[CCB_DEREGISTERED] {identity['agent_name']}")
+    db.close()
+
+
+def main():
+    if "--deregister" in sys.argv:
+        deregister()
+    elif "--heartbeat" in sys.argv:
+        interval = 30
+        for i, arg in enumerate(sys.argv):
+            if arg == "--interval" and i + 1 < len(sys.argv):
+                interval = int(sys.argv[i + 1])
+        heartbeat(interval=interval)
+    else:
+        register()
+
+
+if __name__ == "__main__":
+    main()

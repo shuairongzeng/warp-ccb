@@ -1,0 +1,23 @@
+name = "CCB Pair"
+title = "CCB Agent Pair"
+color = "green"
+
+[[panes]]
+id = "root"
+split = "vertical"
+children = ["left", "right"]
+
+[[panes]]
+id = "left"
+type = "terminal"
+directory = "{{cwd}}"
+is_focused = true
+
+[[panes]]
+id = "right"
+type = "terminal"
+directory = "{{cwd}}"
+
+[params.cwd]
+type = "text"
+description = "Working directory for both agent panes"

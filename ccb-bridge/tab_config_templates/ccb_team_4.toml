@@ -1,0 +1,43 @@
+name = "CCB Team 4"
+title = "CCB 4-Agent Grid"
+color = "yellow"
+
+[[panes]]
+id = "root"
+split = "vertical"
+children = ["left_col", "right_col"]
+
+[[panes]]
+id = "left_col"
+split = "horizontal"
+children = ["tl", "bl"]
+
+[[panes]]
+id = "right_col"
+split = "horizontal"
+children = ["tr", "br"]
+
+[[panes]]
+id = "tl"
+type = "terminal"
+directory = "{{cwd}}"
+is_focused = true
+
+[[panes]]
+id = "bl"
+type = "terminal"
+directory = "{{cwd}}"
+
+[[panes]]
+id = "tr"
+type = "terminal"
+directory = "{{cwd}}"
+
+[[panes]]
+id = "br"
+type = "terminal"
+directory = "{{cwd}}"
+
+[params.cwd]
+type = "text"
+description = "Working directory for all agent panes"

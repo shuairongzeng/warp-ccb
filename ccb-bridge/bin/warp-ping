@@ -1,0 +1,128 @@
+#!/usr/bin/env python
+"""warp-ping — Check CLI agent connectivity
+
+Supports two modes:
+  --mode tcp     : Use TCP JSONL bus (original)
+  --mode sqlite  : Use SQLite bus (default)
+  --mode dual    : Check both
+"""
+
+import sys
+import os
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "lib"))
+
+
+def main():
+    if len(sys.argv) < 2:
+        print("Usage: warp-ping <provider> [options]")
+        print("       warp-ping --list [--mode sqlite|tcp]")
+        print("Options:")
+        print("  --list         List all online agents (alias + provider)")
+        print("  --cwd <dir>    Working directory")
+        print("  --mode <mode>  Bus mode: sqlite (default), tcp, dual")
+        sys.exit(1)
+
+    # Handle --list
+    if sys.argv[1] == "--list":
+        mode = "sqlite"
+        for i, arg in enumerate(sys.argv):
+            if arg == "--mode" and i + 1 < len(sys.argv):
+                mode = sys.argv[i + 1]
+
+        if mode in ("sqlite", "dual"):
+            try:
+                from bus_sqlite import BusDB
+                db = BusDB()
+                agents = db.list_agents(status="online")
+                db.close()
+                if not agents:
+                    print("No agents online.")
+                else:
+                    # Group by real_provider to deduplicate alias + provider entries
+                    by_provider = {}
+                    for a in agents:
+                        p = a["real_provider"]
+                        alias = a["agent_name"]
+                        vid = a.get("view_id")
+                        if p not in by_provider:
+                            by_provider[p] = {"aliases": [], "view_id": None}
+                        entry = by_provider[p]
+                        if vid is not None:
+                            entry["view_id"] = vid
+                        if alias != p:
+                            entry["aliases"].append(alias)
+
+                    for p in sorted(by_provider):
+                        e = by_provider[p]
+                        vid = e["view_id"] or "?"
+                        if e["aliases"]:
+                            for alias in e["aliases"]:
+                                print(f"{alias} ({p}) online, pane={vid}")
+                        else:
+                            print(f"{p} online, pane={vid}")
+            except Exception as e:
+                print(f"Error: {e}", file=sys.stderr)
+                sys.exit(1)
+        return
+
+    provider = sys.argv[1]
+    cwd = None
+    session_id = None
+    mode = "sqlite"
+
+    i = 2
+    while i < len(sys.argv):
+        if sys.argv[i] == "--cwd" and i + 1 < len(sys.argv):
+            cwd = sys.argv[i + 1]
+            i += 2
+        elif sys.argv[i] == "--session-id" and i + 1 < len(sys.argv):
+            session_id = sys.argv[i + 1]
+            i += 2
+        elif sys.argv[i] == "--mode" and i + 1 < len(sys.argv):
+            mode = sys.argv[i + 1]
+            i += 2
+        else:
+            i += 1
+
+    # --- SQLite path ---
+    if mode in ("sqlite", "dual"):
+        try:
+            from bus_sqlite import BusDB
+            db = BusDB(cwd=cwd)
+            result = db.ping_agent(provider)
+            db.close()
+            if result["online"]:
+                print(f"{provider} online (sqlite)")
+            else:
+                print(f"{provider} offline (sqlite): {result['details']}")
+            if mode == "sqlite":
+                return
+        except Exception as e:
+            if mode == "sqlite":
+                print(f"Error: {e}", file=sys.stderr)
+                sys.exit(1)
+
+    # --- TCP path ---
+    if mode in ("tcp", "dual"):
+        try:
+            from bus_client import ping
+            response = ping(provider, cwd=cwd, session_id=session_id)
+            if response.get("ok"):
+                online = response.get("online", False)
+                details = response.get("details", "")
+                session = response.get("session_id", "")
+                if online:
+                    print(f"{provider} connection OK (tcp, session: {session or 'unknown'}, {details})")
+                else:
+                    print(f"{provider} not online (tcp): {details}")
+            else:
+                print(f"Error: {response.get('message', 'unknown error')}", file=sys.stderr)
+                sys.exit(1)
+        except Exception as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

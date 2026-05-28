@@ -1,0 +1,584 @@
+#!/usr/bin/env python
+"""warp-ccb — Launch or stop multiple CLI agent sessions in Warp panes
+
+Usage:
+    warp-ccb codex,claude,droid          # Launch all three agents
+    warp-ccb codex,claude                # Launch only codex and claude
+    warp-ccb codex,claude,droid --prompt "Fix the bug"  # With initial prompt
+    warp-ccb codex,claude --force        # Launch new panes even if sessions exist
+    warp-ccb --list                      # List available providers
+    warp-ccb kill                        # Close all agent sessions and deregister
+    warp-ccb kill writer,reviewer        # Close specific agents by alias
+    warp-ccb kill --all                  # same as kill (close all)
+    warp-ccb register                    # Sync TCP sessions to SQLite bus
+    warp-ccb sync                        # Bridge TCP replies into SQLite
+
+Each agent gets its own terminal pane inside the current Warp window.
+The LocalAgentBus creates new panes automatically via PaneGroup.
+Existing provider sessions are reused by default to avoid duplicate agent processes.
+"""
+
+import sys
+import os
+import time
+import json
+
+# Fix Windows console encoding
+if sys.stdout and hasattr(sys.stdout, 'reconfigure'):
+    try:
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    except Exception:
+        pass
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "lib"))
+from bus_client import launch, list_sessions, ping
+
+def load_config(cwd=None):
+    """Load alias config from .warp-ccb/warp-ccb.config.
+
+    Config format (INI-style):
+        [agents]
+        writer = codex
+        reviewer = codex
+        planner = claude
+    """
+    config_path = os.path.join(cwd or os.getcwd(), ".warp-ccb", "warp-ccb.config")
+    if not os.path.exists(config_path):
+        return []
+    entries = []
+    in_agents = False
+    with open(config_path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("["):
+                in_agents = line.lower().strip("[]") == "agents"
+                continue
+            if in_agents and "=" in line:
+                alias, provider = line.split("=", 1)
+                alias = alias.strip().lower()
+                provider = provider.strip().lower()
+                if provider not in VALID_PROVIDERS:
+                    print(f"Warning: unknown provider '{provider}' for alias '{alias}' in config, skipping", file=sys.stderr)
+                    continue
+                if alias in VALID_PROVIDERS and alias != provider:
+                    print(f"Warning: alias '{alias}' conflicts with a provider name in config, skipping", file=sys.stderr)
+                    continue
+                entries.append((alias, provider))
+    # Deduplicate by alias (first wins)
+    seen = set()
+    unique = []
+    for alias, provider in entries:
+        if alias not in seen:
+            seen.add(alias)
+            unique.append((alias, provider))
+    return unique
+
+
+VALID_PROVIDERS = {"claude", "codex", "gemini", "opencode", "droid", "copilot", "amp", "kimi", "goose"}
+DEFAULT_LAUNCH_VERIFY_TIMEOUT_SECONDS = 30.0
+LAUNCH_VERIFY_INTERVAL_SECONDS = 0.5
+
+
+def parse_providers(arg):
+    """Parse 'alias:provider,provider2,...' into [(alias, provider)] pairs.
+
+    Formats:
+      writer:codex         -> alias='writer', provider='codex'
+      codex                -> alias='codex',   provider='codex'  (no alias)
+      writer:codex,reviewer:codex,planner:claude
+    """
+    entries = []
+    for part in arg.split(","):
+        token = part.strip()
+        if not token:
+            continue
+        if ":" in token:
+            alias, provider = token.split(":", 1)
+            alias = alias.strip().lower()
+            provider = provider.strip().lower()
+        else:
+            alias = token.lower()
+            provider = alias
+        if provider not in VALID_PROVIDERS:
+            print(f"Error: unknown provider: {provider}", file=sys.stderr)
+            print(f"Valid providers: {', '.join(sorted(VALID_PROVIDERS))}", file=sys.stderr)
+            sys.exit(1)
+        if alias in VALID_PROVIDERS and alias != provider:
+            print(f"Error: alias '{alias}' conflicts with a provider name", file=sys.stderr)
+            sys.exit(1)
+        entries.append((alias, provider))
+    if not entries:
+        print("Error: no providers specified", file=sys.stderr)
+        sys.exit(1)
+    # Check for duplicate aliases
+    seen = set()
+    for alias, _ in entries:
+        if alias in seen:
+            print(f"Error: duplicate alias '{alias}'", file=sys.stderr)
+            sys.exit(1)
+        seen.add(alias)
+    return entries
+
+
+def launch_verify_timeout_seconds():
+    raw_value = os.environ.get("WARP_CCB_LAUNCH_VERIFY_TIMEOUT")
+    if not raw_value:
+        return DEFAULT_LAUNCH_VERIFY_TIMEOUT_SECONDS
+    try:
+        return max(0.0, float(raw_value))
+    except ValueError:
+        return DEFAULT_LAUNCH_VERIFY_TIMEOUT_SECONDS
+
+
+def get_existing_view_ids(key):
+    """Get the set of terminal_view_ids currently registered for a provider or alias.
+
+    key can be a provider name or an alias. Checks both s['provider'] and s.get('alias').
+    """
+    try:
+        existing = list_sessions()
+        if existing.get("ok"):
+            return {
+                s.get("terminal_view_id")
+                for s in existing.get("sessions", [])
+                if (s.get("provider") == key or s.get("alias") == key)
+                and s.get("terminal_view_id")
+            }
+    except Exception:
+        pass
+    return set()
+
+
+def wait_for_provider_online(key, timeout_seconds=None, pre_launch_view_ids=None):
+    """Wait until LocalAgentBus reports the launched provider as online.
+
+    key can be a provider name or an alias.
+    When launch() returns view_id=0 (pane creation pending), ping() alone is
+    unreliable because it may match a stale session from a previous run.
+    Instead, we diff list_sessions() against pre_launch_view_ids to detect
+    the newly created session.
+    """
+    timeout = launch_verify_timeout_seconds() if timeout_seconds is None else timeout_seconds
+    deadline = time.monotonic() + timeout
+
+    while True:
+        # Strategy 1: if we have pre-launch view_ids, diff against current sessions
+        if pre_launch_view_ids is not None:
+            try:
+                current_ids = get_existing_view_ids(key)
+                new_ids = current_ids - pre_launch_view_ids
+                if new_ids:
+                    new_id = next(iter(new_ids))
+                    return True, {"online": True, "terminal_view_id": new_id}
+            except Exception:
+                pass
+
+        # Strategy 2: fallback to ping()
+        try:
+            response = ping(key)
+            if response.get("ok") and response.get("online"):
+                return True, response
+            last_details = response.get("details", response.get("message", "not online"))
+        except Exception as e:
+            last_details = str(e)
+
+        if time.monotonic() >= deadline:
+            return False, {"details": last_details}
+
+        time.sleep(LAUNCH_VERIFY_INTERVAL_SECONDS)
+
+
+def sync_tcp_replies():
+    """Bridge replies from TCP bus into SQLite.
+
+    Polls TCP pend for each online provider and writes any new replies
+    into the SQLite bus. This closes the loop: agent replies captured
+    by the Rust bus (via terminal output scanning) are made available
+    to SQLite-only consumers.
+    """
+    from bus_sqlite import BusDB
+    db = BusDB()
+    count = db.sync_from_tcp()
+    db.close()
+    if count > 0:
+        print(f"Synced {count} new reply(s) from TCP to SQLite.")
+    else:
+        print("No new replies to sync.")
+
+
+def register_all_sessions():
+    """Sync TCP sessions into the SQLite bus_agents table.
+
+    Discovers all active sessions from the TCP bus and registers each
+    into SQLite under both alias and provider names. Also handles reused
+    sessions that were not registered during launch.
+    """
+    sessions = []
+
+    # TCP sessions
+    try:
+        existing = list_sessions()
+        if existing.get("ok"):
+            sessions = existing.get("sessions", [])
+    except Exception:
+        pass
+
+    if not sessions:
+        print("No active TCP sessions found.")
+        return
+
+    from bus_sqlite import BusDB
+    db = BusDB()
+    registered = 0
+    for s in sessions:
+        alias = s.get("alias")
+        provider = s.get("provider", "")
+        tid = s.get("terminal_view_id")
+
+        # Register under alias
+        if alias:
+            db.register_agent(alias, provider, view_id=tid)
+            registered += 1
+            print(f"[{alias}] ({provider}) registered, view_id={tid}")
+
+        # Register under provider name too (so warp-ping provider works)
+        db.register_agent(provider, provider, view_id=tid)
+        if not alias:
+            registered += 1
+            print(f"[{provider}] registered, view_id={tid}")
+
+    db.close()
+    print(f"\nRegistered {registered} entries in SQLite bus")
+
+
+def kill_sessions(targets=None):
+    """Close agent sessions and deregister from SQLite bus.
+
+    Args:
+        targets: List of alias/provider names to kill. If None/empty, kill all.
+    """
+    # Collect sessions from both TCP and SQLite
+    sessions = []
+
+    # TCP sessions
+    try:
+        existing = list_sessions()
+        if existing.get("ok"):
+            for s in existing.get("sessions", []):
+                sessions.append(s)
+    except Exception:
+        pass
+
+    # SQLite sessions
+    try:
+        from bus_sqlite import BusDB
+        db = BusDB()
+        sqlite_agents = db.list_agents(status="online")
+        for a in sqlite_agents:
+            sessions.append({
+                "provider": a["real_provider"],
+                "alias": a["agent_name"] if a["agent_name"] != a["real_provider"] else None,
+                "terminal_view_id": a.get("view_id"),
+            })
+        db.close()
+    except Exception:
+        pass
+
+    # Deduplicate by terminal_view_id
+    seen_ids = set()
+    unique = []
+    for s in sessions:
+        tid = s.get("terminal_view_id")
+        if tid and tid not in seen_ids:
+            seen_ids.add(tid)
+            unique.append(s)
+    sessions = unique
+
+    # Filter by targets if specified
+    if targets:
+        target_set = set(targets)
+        sessions = [
+            s for s in sessions
+            if s.get("alias") in target_set or s.get("provider") in target_set
+        ]
+
+    if not sessions:
+        print("No active sessions to close.")
+        return
+
+    closed = 0
+    failed = 0
+    for s in sessions:
+        key = s.get("alias") or s.get("provider", "?")
+        tid = s.get("terminal_view_id")
+        provider = s.get("provider", "")
+
+        # Close via TCP
+        tcp_ok = False
+        if tid:
+            try:
+                result = close_session(provider, tid)
+                tcp_ok = result.get("ok", False)
+            except Exception:
+                pass
+
+        # Deregister from SQLite
+        try:
+            from bus_sqlite import BusDB
+            db = BusDB()
+            db.deregister_agent(key)
+            db.close()
+        except Exception:
+            pass
+
+        if tcp_ok or tid:
+            closed += 1
+            print(f"[{key}] closed pane {tid}")
+        else:
+            failed += 1
+            print(f"[{key}] deregistered (no pane to close)")
+
+    print(f"\nDone: {closed} closed, {failed} deregistered")
+
+
+def main():
+    if len(sys.argv) < 2:
+        # No args: try config file, otherwise print help
+        config_entries = load_config()
+        if config_entries:
+            entries = config_entries
+        else:
+            print(__doc__.strip())
+            sys.exit(1)
+    else:
+        entries = None
+        prompt = None
+        force = False
+
+        i = 1
+        while i < len(sys.argv):
+            arg = sys.argv[i]
+            if arg in ("-h", "--help"):
+                print(__doc__.strip())
+                sys.exit(0)
+            elif arg in ("-l", "--list"):
+                print("Available providers:")
+                for p in sorted(VALID_PROVIDERS):
+                    print(f"  {p}")
+                sys.exit(0)
+            elif arg in ("kill", "stop", "down"):
+                # Parse optional target list: warp-ccb kill writer,reviewer
+                targets = None
+                if i + 1 < len(sys.argv) and not sys.argv[i + 1].startswith("-"):
+                    targets = [t.strip().lower() for t in sys.argv[i + 1].split(",") if t.strip()]
+                kill_sessions(targets)
+                sys.exit(0)
+            elif arg == "register":
+                # Sync TCP sessions to SQLite bus
+                register_all_sessions()
+                sys.exit(0)
+            elif arg == "sync":
+                # Bridge TCP replies into SQLite
+                sync_tcp_replies()
+                sys.exit(0)
+            elif arg in ("-p", "--prompt") and i + 1 < len(sys.argv):
+                prompt = sys.argv[i + 1]
+                i += 2
+            elif arg in ("-f", "--force"):
+                force = True
+                i += 1
+            elif arg.startswith("-"):
+                print(f"Error: unknown option: {arg}", file=sys.stderr)
+                sys.exit(1)
+            else:
+                # Positional arg: comma-separated provider/alias list
+                entries = parse_providers(arg)
+                i += 1
+
+        if entries is None:
+            # Had args but no positional — try config file
+            config_entries = load_config()
+            if config_entries:
+                entries = config_entries
+            else:
+                print("Error: no providers specified", file=sys.stderr)
+                print("Usage: warp-ccb codex,claude,droid", file=sys.stderr)
+                sys.exit(1)
+
+    prompt = locals().get("prompt")
+    force = locals().get("force", False)
+
+    # Clean slate: deregister all agents, then re-register from scratch.
+    try:
+        from bus_sqlite import BusDB
+        _cleanup_db = BusDB()
+        online_count = len(_cleanup_db.list_agents(status="online"))
+        if online_count > 0:
+            _cleanup_db.deregister_all()
+            print(f"Cleaned up {online_count} stale session(s) from previous run")
+        _cleanup_db.close()
+    except Exception:
+        pass
+
+    # Build a view_id -> session mapping for precise dedup
+    # (same provider can have multiple aliases with different view_ids)
+    active_by_alias = {}  # alias -> list of sessions
+    active_by_view_id = {}  # view_id -> session (for dedup within same provider)
+    try:
+        # Try SQLite first (works without Warp)
+        from bus_sqlite import BusDB
+        _sdb = BusDB()
+        sqlite_agents = _sdb.list_agents(status="online")
+        _sdb.close()
+        for a in sqlite_agents:
+            key = a["agent_name"]
+            vid = a.get("view_id")
+            session = {
+                "provider": a["real_provider"],
+                "alias": a["agent_name"] if a["agent_name"] != a["real_provider"] else None,
+                "terminal_view_id": vid or 0,
+                "status": a["status"],
+            }
+            active_by_alias.setdefault(key, []).append(session)
+            if vid:
+                active_by_view_id[vid] = session
+    except Exception:
+        pass
+
+    # Also check TCP sessions
+    try:
+        existing = list_sessions()
+        if existing.get("ok"):
+            for s in existing.get("sessions", []):
+                key = s.get("alias") or s["provider"]
+                active_by_alias.setdefault(key, []).append(s)
+                vid = s.get("terminal_view_id")
+                if vid:
+                    active_by_view_id[vid] = s
+    except Exception:
+        pass
+
+    # Launch each (alias, provider) entry sequentially
+    results = []
+    # Track which view_ids have been claimed to prevent two aliases
+    # with the same provider from reusing the same pane
+    claimed_view_ids = set()
+    for alias, provider in entries:
+        # Use alias as the unique key for dedup
+        if alias in active_by_alias:
+            count = len(active_by_alias[alias])
+            # Find a session whose view_id hasn't been claimed yet
+            session = None
+            for s in active_by_alias[alias]:
+                vid = s.get("terminal_view_id")
+                if vid and vid not in claimed_view_ids:
+                    session = s
+                    break
+            if not session:
+                session = active_by_alias[alias][0]
+
+            if not force:
+                tid = session.get("terminal_view_id", "?")
+                if tid and tid != "?":
+                    claimed_view_ids.add(tid)
+                results.append({"provider": provider, "alias": alias, "terminal": tid, "status": "reused"})
+                print(
+                    f"[{alias}] already has {count} active session(s), "
+                    f"reusing terminal pane {tid} (use --force to launch another)"
+                )
+
+                # Register reused session in SQLite too
+                try:
+                    from bus_sqlite import BusDB
+                    _sdb = BusDB()
+                    _sdb.register_agent(alias, provider, view_id=tid, pid=os.getpid())
+                    if alias != provider:
+                        _sdb.register_agent(provider, provider, view_id=tid, pid=os.getpid())
+                    _sdb.close()
+                except Exception:
+                    pass
+                continue
+            print(f"[{alias}] already has {count} active session(s), launching another pane (--force)...")
+
+        try:
+            pre_launch_ids = get_existing_view_ids(alias)
+            response = launch(provider, prompt=prompt, alias=alias if alias != provider else None)
+            if response.get("ok"):
+                tid = response.get("terminal_view_id", "?")
+
+                # Register in SQLite IMMEDIATELY after launch() returns ok,
+                # before waiting for TCP online. This ensures discoverability
+                # even if TCP is slow or unavailable.
+                try:
+                    from bus_sqlite import BusDB
+                    _sdb = BusDB()
+                    # Register under alias (e.g. "writer")
+                    _sdb.register_agent(alias, provider, view_id=tid if tid != 0 else None, pid=os.getpid())
+                    # Also register under real provider name (e.g. "kimi")
+                    # so warp-ping kimi also finds it
+                    if alias != provider:
+                        _sdb.register_agent(provider, provider, view_id=tid if tid != 0 else None, pid=os.getpid())
+                    _sdb.close()
+                except Exception:
+                    pass
+
+                if tid == 0:
+                    online, online_response = wait_for_provider_online(
+                        alias, pre_launch_view_ids=pre_launch_ids
+                    )
+                else:
+                    online, online_response = wait_for_provider_online(alias)
+                if online:
+                    actual_tid = online_response.get("terminal_view_id", tid)
+                    results.append({"provider": provider, "alias": alias, "terminal": actual_tid, "status": "launched"})
+                    print(f"[{alias}] ({provider}) launched in terminal pane {actual_tid}")
+
+                    # Update SQLite registration with actual view_id
+                    try:
+                        from bus_sqlite import BusDB
+                        _sdb = BusDB()
+                        _sdb.register_agent(alias, provider, view_id=actual_tid, pid=os.getpid())
+                        if alias != provider:
+                            _sdb.register_agent(provider, provider, view_id=actual_tid, pid=os.getpid())
+                        _sdb.close()
+                    except Exception:
+                        pass
+                else:
+                    details = online_response.get("details", "not online")
+                    msg = (
+                        f"launched in terminal pane {tid}, but not registered online "
+                        f"after {launch_verify_timeout_seconds():.0f}s: {details}"
+                    )
+                    results.append({"provider": provider, "alias": alias, "terminal": tid, "status": "error", "error": msg})
+                    print(f"[{alias}] error: {msg}", file=sys.stderr)
+            else:
+                msg = response.get("message", "unknown error")
+                results.append({"provider": provider, "alias": alias, "status": "error", "error": msg})
+                print(f"[{alias}] error: {msg}", file=sys.stderr)
+        except FileNotFoundError as e:
+            results.append({"provider": provider, "alias": alias, "status": "error", "error": str(e)})
+            print(f"[{alias}] error: {e}", file=sys.stderr)
+            print("Is Warp running with LocalAgentBus enabled?", file=sys.stderr)
+            sys.exit(1)
+        except Exception as e:
+            results.append({"provider": provider, "alias": alias, "status": "error", "error": str(e)})
+            print(f"[{alias}] error: {e}", file=sys.stderr)
+
+        # Small delay between launches to let PaneGroup create panes
+        if (alias, provider) != entries[-1]:
+            time.sleep(1.5)
+
+    # Summary
+    launched = sum(1 for r in results if r["status"] == "launched")
+    reused = sum(1 for r in results if r["status"] == "reused")
+    failed = sum(1 for r in results if r["status"] == "error")
+    print(f"\nDone: {launched} launched, {reused} reused, {failed} failed")
+
+    if failed > 0:
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

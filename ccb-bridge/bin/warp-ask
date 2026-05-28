@@ -1,0 +1,184 @@
+#!/usr/bin/env python
+"""warp-ask — Send a prompt to a CLI agent via Warp LocalAgentBus"""
+
+import sys
+import os
+import time
+
+if sys.stdout and hasattr(sys.stdout, 'reconfigure'):
+    try:
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    except Exception:
+        pass
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "lib"))
+
+_LOG_DIR = os.path.join(os.path.expanduser("~"), ".warp-ccb", "logs")
+os.makedirs(_LOG_DIR, exist_ok=True)
+
+
+def _log(msg):
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    line = f"[{ts}] [warp-ask] {msg}"
+    try:
+        with open(os.path.join(_LOG_DIR, "ccb.log"), "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
+
+
+def main():
+    if len(sys.argv) < 3:
+        print("Usage: warp-ask <provider> <message> [options]")
+        print("Options:")
+        print("  --mode <tcp|sqlite|dual>  Bus mode (default: dual)")
+        print("  --queue                   Queue the request")
+        print("  --no-wait                 Send without waiting for reply")
+        print("  --timeout N               Wait timeout in seconds (default: 86400)")
+        print("  --caller <caller>         Override caller name")
+        print("  --cwd <dir>               Working directory")
+        print("  --session-id <id>         Session ID")
+        sys.exit(1)
+
+    provider = sys.argv[1]
+    message = sys.argv[2]
+    caller = None
+    cwd = None
+    session_id = None
+    queue = False
+    do_wait = False  # No need to wait — deliver_callback auto-injects reply into caller pane
+    wait_timeout = 86400
+    mode = "dual"
+
+    i = 3
+    while i < len(sys.argv):
+        if sys.argv[i] == "--caller" and i + 1 < len(sys.argv):
+            caller = sys.argv[i + 1]
+            i += 2
+        elif sys.argv[i] == "--cwd" and i + 1 < len(sys.argv):
+            cwd = sys.argv[i + 1]
+            i += 2
+        elif sys.argv[i] == "--session-id" and i + 1 < len(sys.argv):
+            session_id = sys.argv[i + 1]
+            i += 2
+        elif sys.argv[i] == "--queue":
+            queue = True
+            i += 1
+        elif sys.argv[i] == "--no-wait":
+            do_wait = False
+            i += 1
+        elif sys.argv[i] == "--wait":
+            do_wait = True
+            i += 1
+        elif sys.argv[i] == "--timeout" and i + 1 < len(sys.argv):
+            wait_timeout = int(sys.argv[i + 1])
+            i += 2
+        elif sys.argv[i] == "--mode" and i + 1 < len(sys.argv):
+            mode = sys.argv[i + 1]
+            i += 2
+        else:
+            i += 1
+
+    _log(f"START provider={provider} mode={mode} do_wait={do_wait} timeout={wait_timeout} caller={caller}")
+
+    try:
+        # --- SQLite path ---
+        sqlite_ok = False
+        sqlite_req_id = None
+        if mode in ("sqlite", "dual"):
+            from bus_sqlite import BusDB
+            db = BusDB(cwd=cwd)
+            sqlite_req_id = db.ask(
+                provider, message, caller=caller,
+                caller_cwd=cwd, caller_session_id=session_id,
+            )
+            sqlite_ok = True
+            db.close()
+            _log(f"SQLite ask OK req_id={sqlite_req_id}")
+
+        # --- TCP path ---
+        tcp_ok = False
+        tcp_req_id = None
+        tcp_response = None
+        if mode in ("tcp", "dual"):
+            try:
+                from bus_client import ask as tcp_ask
+                tcp_response, tcp_req_id = tcp_ask(
+                    provider, message, req_id=sqlite_req_id,
+                    caller=caller, cwd=cwd,
+                    session_id=session_id, queue=queue,
+                )
+                tcp_ok = True
+                _log(f"TCP ask OK req_id={tcp_req_id} type={tcp_response.get('type')} ok={tcp_response.get('ok')}")
+            except FileNotFoundError as e:
+                _log(f"TCP ask FAILED FileNotFoundError: {e}")
+                if mode == "tcp":
+                    raise
+            except Exception as e:
+                _log(f"TCP ask FAILED: {type(e).__name__}: {e}")
+                if mode == "tcp":
+                    raise
+
+        req_id = sqlite_req_id or tcp_req_id or ""
+        _log(f"Resolved req_id={req_id} sqlite_ok={sqlite_ok} tcp_ok={tcp_ok}")
+
+        if tcp_ok and tcp_response:
+            if not tcp_response.get("ok") and not sqlite_ok:
+                print(f"Error: {tcp_response.get('message', 'unknown error')}", file=sys.stderr)
+                sys.exit(1)
+            if tcp_response.get("type") == "ask_skipped":
+                print(f"[CCB_SKIPPED provider={provider}]")
+                print(f"req_id: {tcp_response.get('req_id', req_id)}")
+                print(f"reason: {tcp_response.get('reason', 'self_request_skipped')}")
+                return
+
+        if do_wait:
+            _log(f"Entering wait req_id={req_id} timeout={wait_timeout}s")
+            print(f"[{req_id}] waiting for {provider}...")
+
+            if mode in ("sqlite", "dual") and sqlite_req_id:
+                from bus_sqlite import BusDB
+                db = BusDB(cwd=cwd)
+                t0 = time.monotonic()
+                result = db.wait(sqlite_req_id, timeout=wait_timeout)
+                elapsed_s = time.monotonic() - t0
+                db.close()
+                _log(f"SQLite wait done ok={result.get('ok')} elapsed={elapsed_s:.1f}s content_len={len(result.get('content', ''))}")
+            elif tcp_ok:
+                from bus_client import wait as tcp_wait
+                result = tcp_wait(req_id=req_id, timeout=wait_timeout, cwd=cwd)
+                _log(f"TCP wait done ok={result.get('ok')}")
+            else:
+                _log("No bus available for wait")
+                print("Error: no bus available for wait", file=sys.stderr)
+                sys.exit(1)
+
+            if result.get("ok"):
+                status = result.get("status", "unknown")
+                content = result.get("content", "")
+                elapsed = result.get("elapsed_ms", 0)
+                _log(f"REPLY status={status} elapsed={elapsed}ms content_len={len(content)}")
+                print(f"[{req_id}] ({status}) {elapsed}ms")
+                if content:
+                    print(content)
+            else:
+                _log(f"Wait FAILED: {result.get('message')}")
+                print(f"Error: {result.get('message', 'unknown error')}", file=sys.stderr)
+                sys.exit(1)
+        else:
+            _log("Async mode, not waiting")
+            print(f"[CCB_ASYNC_SUBMITTED provider={provider}]")
+            print(f"req_id: {req_id}")
+            if sqlite_ok:
+                print(f"sqlite: true")
+            if tcp_ok:
+                print(f"tcp: true")
+
+    except Exception as e:
+        _log(f"EXCEPTION: {type(e).__name__}: {e}")
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

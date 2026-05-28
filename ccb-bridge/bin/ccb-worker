@@ -1,0 +1,333 @@
+#!/usr/bin/env python
+"""ccb-worker — Per-agent daemon: watch SQLite for new tasks and auto-reply
+
+Runs in each agent pane as a background process. Watches bus_notifications
+for `new_request` messages addressed to this agent. When a new task arrives:
+  1. Writes the task prompt to a file for the agent to process
+  2. Waits for the agent to produce output (detects output file completion)
+  3. Calls warp-reply to write the result back to SQLite
+
+Usage:
+    ccb-worker                          # Auto-detect identity from env vars
+    ccb-worker --agent kimi             # Explicit agent name
+    ccb-worker --no-inject              # Only watch, don't inject into pane
+"""
+
+import json
+import os
+import sys
+import time
+import threading
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "lib"))
+from bus_sqlite import BusDB
+
+
+def get_agent_identity():
+    """Get this agent's name from env vars or auto-detect."""
+    return os.environ.get("WARP_CCB_PROVIDER") or os.environ.get("CCB_AGENT_NAME")
+
+
+def get_real_provider():
+    """Get the real provider name (e.g. kimi, droid) as opposed to alias (e.g. writer, reviewer)."""
+    return os.environ.get("WARP_CCB_REAL_PROVIDER", "")
+
+
+class AgentWorker:
+    def __init__(self, agent_name, cwd=None, poll_interval=1.0):
+        self.agent_name = agent_name
+        self.cwd = cwd or os.getcwd()
+        self.poll_interval = poll_interval
+        self.db = BusDB(cwd=self.cwd)
+        self.running = True
+        self.seen_ids = set()
+        # Task inbox directory
+        self.inbox_dir = os.path.join(self.cwd, ".ccb-tasks", agent_name)
+        os.makedirs(self.inbox_dir, exist_ok=True)
+
+    def stop(self):
+        self.running = False
+
+    # How often (in main-loop iterations) to sweep for orphaned `ask` rows
+    # that lost their notification (e.g. consumed by a buggy peer or a
+    # crash between consume and dispatch). With poll_interval=1.0 the
+    # default sweeps every ~10s.
+    SWEEP_EVERY = 10
+
+    def run(self):
+        """Main loop: watch for new notifications and process tasks."""
+        # Mark agent online
+        real_provider = get_real_provider() or self.agent_name
+        self.db.register_agent(self.agent_name, real_provider, pid=os.getpid())
+        print(f"[ccb-worker] {self.agent_name} ({real_provider}) started, watching for tasks...")
+
+        # Recover any pending asks left orphaned from previous runs or lost
+        # notifications BEFORE entering the normal notification loop.
+        try:
+            self._sweep_orphan_asks()
+        except Exception as e:
+            print(f"[ccb-worker] startup sweep error: {e}", file=sys.stderr)
+
+        try:
+            tick = 0
+            while self.running:
+                try:
+                    self._check_notifications()
+                    tick += 1
+                    if tick % self.SWEEP_EVERY == 0:
+                        self._sweep_orphan_asks()
+                except Exception as e:
+                    print(f"[ccb-worker] error: {e}", file=sys.stderr)
+                time.sleep(self.poll_interval)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            self.db.deregister_agent(self.agent_name)
+            self.db.close()
+            print(f"[ccb-worker] {self.agent_name} stopped.")
+
+    def _check_notifications(self):
+        """Check for new_request and reply_ready notifications for this agent."""
+        notifs = self.db.get_notifications(self.agent_name, consume=True)
+        for n in notifs:
+            ntype = n.get("notif_type", "")
+            req_id = n.get("req_id", "")
+            if not req_id or req_id in self.seen_ids:
+                continue
+
+            if ntype == "new_request":
+                self.seen_ids.add(req_id)
+                # Run wait_for_reply in a thread so it doesn't block the main loop
+                t = threading.Thread(
+                    target=self._handle_request, args=(req_id,),
+                    daemon=True, name=f"ccb-wait-{req_id[:12]}",
+                )
+                t.start()
+            elif ntype == "reply_ready":
+                self.seen_ids.add(req_id)
+                self._handle_reply_ready(req_id)
+
+    def _sweep_orphan_asks(self):
+        """Pick up `pending` asks addressed to me whose notification was lost.
+
+        A notification can be lost if a CLI tool consumed it without acting on
+        it (older versions of warp-pend did this) or if this worker crashed
+        between consuming the notification and marking the ask delivered.
+        Once an ask is marked `delivered`/`done`/`cancelled`, mark_delivered
+        / reply / cancel have already moved it out of `pending`, so this
+        sweep is safe to run repeatedly.
+        """
+        rows = self.db._conn.execute(
+            """SELECT req_id FROM bus_messages
+               WHERE to_agent=? AND msg_type='ask' AND status='pending'
+               ORDER BY priority DESC, created_at ASC""",
+            (self.agent_name,),
+        ).fetchall()
+        for row in rows:
+            req_id = row["req_id"]
+            if req_id in self.seen_ids:
+                continue
+            self.seen_ids.add(req_id)
+            print(f"[ccb-worker] orphan ask recovered: {req_id}")
+            t = threading.Thread(
+                target=self._handle_request, args=(req_id,),
+                daemon=True, name=f"ccb-orphan-{req_id[:12]}",
+            )
+            t.start()
+
+    def _handle_request(self, req_id):
+        """Process a new request: write task file, wait for completion, reply."""
+        try:
+            req = self.db.get_request(req_id)
+            if not req:
+                print(f"[ccb-worker] ERROR: no request found for {req_id}", file=sys.stderr)
+                return
+
+            prompt = req.get("content", "")
+            from_agent = req.get("from_agent", "unknown")
+
+            print(f"[ccb-worker] New task: {req_id} from {from_agent}")
+            print(f"[ccb-worker] Prompt: {prompt[:200]}")
+
+            # Mark as delivered
+            self.db.mark_delivered(req_id)
+
+            # Write task to inbox file
+            task_file = os.path.join(self.inbox_dir, f"{req_id}.md")
+            with open(task_file, "w", encoding="utf-8") as f:
+                f.write(f"# CCB Task: {req_id}\n\n")
+                f.write(f"**From**: {from_agent}\n\n")
+                f.write(f"## Task\n\n{prompt}\n\n")
+                f.write(f"## Reply Instructions\n\n")
+                f.write(f"After completing this task, write your reply to:\n")
+                f.write(f"```\n{self._reply_file_path(req_id)}\n```\n")
+                f.write(f"Or use:\n")
+                f.write(f"```\nwarp-reply --req-id {req_id} --content-file <path>\n```\n")
+
+            # Print prompt to stdout — the agent sees this in terminal
+            self._inject_prompt(req_id, prompt, from_agent)
+
+            # Wait for reply (watch for reply file or warp-reply, no timeout)
+            self._wait_for_reply(req_id)
+        except Exception as e:
+            print(f"[ccb-worker] ERROR handling {req_id}: {e}", file=sys.stderr)
+
+    def _reply_file_path(self, req_id):
+        return os.path.join(self.inbox_dir, f"{req_id}.reply.md")
+
+    def _inject_prompt(self, req_id, prompt, from_agent):
+        """Inject the task prompt into the agent's terminal pane."""
+        wrapped = (
+            f"[CCB_REQ_ID:{req_id}]\n"
+            f"From: {from_agent}\n\n"
+            f"{prompt}\n\n"
+            f"---\n"
+            f"After completing, reply via:\n"
+            f"  warp-reply --req-id {req_id} --content-file <file>\n"
+            f"Or write output to: {self._reply_file_path(req_id)}\n"
+        )
+
+        # Print to stdout — the agent's CLI may pick this up
+        print(wrapped)
+
+    def _wait_for_reply(self, req_id):
+        """Wait for the agent to produce a reply (via file or warp-reply), then push to caller."""
+        reply_file = self._reply_file_path(req_id)
+        poll = 2.0
+
+        while self.running:
+            # Check if reply was written via warp-reply directly
+            reply = self.db.get_reply(req_id)
+            if reply:
+                print(f"[ccb-worker] Reply received via warp-reply for {req_id}")
+                self._push_to_caller(req_id, reply["content"])
+                self._cleanup_task(req_id)
+                return
+
+            # Check if reply file was written
+            if os.path.exists(reply_file):
+                try:
+                    with open(reply_file, "r", encoding="utf-8") as f:
+                        content = f.read().strip()
+                    if content:
+                        self.db.reply(req_id, content, caller=self.agent_name,
+                                     source="ccb-worker-file", confidence=0.9)
+                        print(f"[ccb-worker] Auto-replied for {req_id} ({len(content)} chars)")
+                        self._push_to_caller(req_id, content)
+                        self._cleanup_task(req_id)
+                        return
+                except Exception:
+                    pass
+
+            time.sleep(poll)
+
+        print(f"[ccb-worker] Stopped while waiting for reply: {req_id}", file=sys.stderr)
+        self._cleanup_task(req_id)
+
+    def _push_to_caller(self, req_id, content):
+        """Push reply to the caller's pane via TCP inject."""
+        req = self.db.get_request(req_id)
+        if not req:
+            return
+        caller = req.get("from_agent", "")
+        if not caller:
+            return
+
+        inject_prompt = (
+            f"[CCB_REPLY:req_id={req_id}]\n"
+            f"Reply from {self.agent_name}:\n\n"
+            f"{content}\n"
+        )
+
+        try:
+            from bus_client import ask as tcp_ask
+            response, _ = tcp_ask(caller, inject_prompt, caller=self.agent_name)
+            if response.get("ok"):
+                print(f"[ccb-worker] Pushed reply to {caller} via TCP inject")
+            else:
+                print(f"[ccb-worker] TCP inject to {caller} failed: {response.get('message', '?')}")
+        except Exception as e:
+            print(f"[ccb-worker] TCP inject skipped ({e}), reply saved in SQLite")
+
+    def _handle_reply_ready(self, req_id):
+        """Handle a reply_ready notification — inject the reply into our pane."""
+        reply = self.db.get_reply(req_id)
+        if not reply:
+            return
+
+        content = reply.get("content", "")
+        from_agent = reply.get("from_agent", "")
+        if not content:
+            return
+
+        inject_prompt = (
+            f"[CCB_REPLY:req_id={req_id}]\n"
+            f"Reply from {from_agent}:\n\n"
+            f"{content}\n"
+        )
+
+        try:
+            from bus_client import ask as tcp_ask
+            response, _ = tcp_ask(self.agent_name, inject_prompt, caller=from_agent)
+            if response.get("ok"):
+                print(f"[ccb-worker] Pushed reply for {req_id} from {from_agent} into pane")
+            else:
+                print(f"[ccb-worker] Pane inject failed for {req_id}: {response.get('message', '?')}")
+        except Exception as e:
+            print(f"[ccb-worker] Pane inject skipped ({e}), reply available in SQLite")
+
+    def _cleanup_task(self, req_id):
+        """Remove task and reply files."""
+        for suffix in [".md", ".reply.md"]:
+            path = os.path.join(self.inbox_dir, f"{req_id}{suffix}")
+            if os.path.exists(path):
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+
+
+def main():
+    agent_name = None
+    poll_interval = 1.0
+    no_inject = False
+
+    i = 1
+    while i < len(sys.argv):
+        arg = sys.argv[i]
+        if arg == "--agent" and i + 1 < len(sys.argv):
+            agent_name = sys.argv[i + 1]
+            i += 2
+        elif arg == "--poll" and i + 1 < len(sys.argv):
+            poll_interval = float(sys.argv[i + 1])
+            i += 2
+        elif arg == "--no-inject":
+            no_inject = True
+            i += 1
+        elif arg in ("-h", "--help"):
+            print(__doc__.strip())
+            sys.exit(0)
+        else:
+            i += 1
+
+    if not agent_name:
+        agent_name = get_agent_identity()
+
+    if not agent_name:
+        print("Error: agent name not specified. Set WARP_CCB_PROVIDER or use --agent", file=sys.stderr)
+        sys.exit(1)
+
+    worker = AgentWorker(agent_name, poll_interval=poll_interval)
+
+    # Handle graceful shutdown
+    import signal
+    def on_signal(sig, frame):
+        worker.stop()
+    signal.signal(signal.SIGINT, on_signal)
+    signal.signal(signal.SIGTERM, on_signal)
+
+    worker.run()
+
+
+if __name__ == "__main__":
+    main()

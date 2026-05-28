@@ -1,0 +1,56 @@
+#!/usr/bin/env python
+"""warp-close — Close an agent pane or session via Warp LocalAgentBus"""
+
+import sys
+import os
+
+# Fix Windows console encoding for Unicode output
+if sys.stdout and hasattr(sys.stdout, 'reconfigure'):
+    try:
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    except Exception:
+        pass
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'lib'))
+from bus_client import close_pane, close_session
+
+
+def main():
+    if len(sys.argv) < 3:
+        print('Usage: warp-close <command> <args>')
+        print('  warp-close pane <view_id>')
+        print('  warp-close session <provider> <view_id>')
+        sys.exit(1)
+
+    command = sys.argv[1]
+
+    try:
+        if command == 'pane':
+            view_id = int(sys.argv[2])
+            result = close_pane(view_id)
+        elif command == 'session':
+            if len(sys.argv) < 4:
+                print('Usage: warp-close session <provider> <view_id>', file=sys.stderr)
+                sys.exit(1)
+            provider = sys.argv[2]
+            view_id = int(sys.argv[3])
+            result = close_session(provider, view_id)
+        else:
+            print(f'Unknown command: {command}', file=sys.stderr)
+            sys.exit(1)
+
+        if result.get('ok'):
+            print(f'[CCB_{result.get("type", "unknown").upper()}]')
+            print(f'view_id: {result.get("view_id", "?")}')
+            if result.get('provider'):
+                print(f'provider: {result["provider"]}')
+        else:
+            print(f'Error: {result.get("message", "unknown error")}', file=sys.stderr)
+            sys.exit(1)
+    except Exception as e:
+        print(f'Error: {e}', file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == '__main__':
+    main()

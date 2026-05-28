@@ -1,0 +1,384 @@
+#!/usr/bin/env python3
+"""ccb-setup — Install CCB Warp LocalAgentBus tools
+
+Adds ccb-bridge/bin to PATH and installs skills for all supported agents
+(Claude, Codex, Droid, Gemini, OpenCode, Kimi, Goose).
+"""
+
+import json
+import os
+import sys
+import shutil
+
+BRIDGE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
+BIN_DIR = os.path.join(BRIDGE_DIR, "bin")
+SKILLS_DIR = os.path.join(BRIDGE_DIR, "skills")
+
+# Skill content template — uses just command names (warp-ask, warp-ping, etc.)
+# so it works regardless of where ccb-bridge is installed, as long as bin/ is in PATH
+
+# Skill content template — uses SQLite bus as primary, TCP as fallback.
+# The shell syntax varies: Claude uses PowerShell, others use bash.
+
+ASK_SKILL_COMMON = r'''
+## How Replies Work
+
+After you send a message, the target agent processes the task and calls
+`warp-reply` to submit its response. The Warp bus then pushes the reply
+directly into your pane. You will see the reply appear automatically — no
+polling needed.
+
+If you need to check reply status manually:
+
+```bash
+warp-pend $ALIAS --req-id $REQ_ID
+```
+
+## Agent Names (IMPORTANT)
+
+Agents are identified by **alias** (e.g. `writer`, `reviewer`) NOT provider
+name. Use `warp-ping --list` to discover who is online and what their alias is.
+When sending messages, use the alias as the target:
+
+```bash
+warp-ask writer "hello"    # CORRECT — uses alias
+warp-ask kimi "hello"      # MAY WORK but alias is preferred
+```
+'''
+
+CLAUDE_ASK_SKILL = r'''---
+name: warp-ask
+description: Send a message to another AI agent via CCB bus. Waits for the reply.
+metadata:
+  short-description: Send message to another agent and wait for reply
+---
+
+# Warp Ask - Cross-Agent Communication
+
+Send a message to another AI agent via the CCB bus. The command waits until
+the target agent replies, then prints the response.
+
+## Step 1: Discover Online Agents (MANDATORY)
+
+```powershell
+warp-ping --list
+```
+
+This shows all online agents with their aliases and provider names.
+Use the **alias** (leftmost name) as the target for messages.
+
+If no agents are online, report that nobody is available.
+
+## Step 2: Send Message and Wait for Reply
+
+```powershell
+warp-ask $ALIAS "$MESSAGE" --caller claude
+```
+
+This sends the message and **waits** for the reply. The reply content will
+be printed to stdout when it arrives. Use `--timeout N` to set max wait time
+(default: 24 hours).
+
+## Rules
+
+- The command blocks until the target agent replies.
+- You can send to multiple agents sequentially.
+- Use `--no-wait` to send without waiting (fire and forget).
+''' + ASK_SKILL_COMMON
+
+BASH_ASK_SKILL = r'''---
+name: warp-ask
+description: Send a message to another AI agent via CCB bus. Waits for the reply.
+metadata:
+  short-description: Send message to another agent and wait for reply
+---
+
+# Warp Ask - Cross-Agent Communication
+
+Send a message to another AI agent via the CCB bus. The command waits until
+the target agent replies, then prints the response.
+
+## Step 1: Discover Online Agents (MANDATORY)
+
+```bash
+warp-ping --list
+```
+
+This shows all online agents with their aliases and provider names.
+Use the **alias** (leftmost name) as the target for messages.
+
+If no agents are online, report that nobody is available.
+
+## Step 2: Send Message and Wait for Reply
+
+```bash
+warp-ask $ALIAS "$MESSAGE" --caller $SELF
+```
+
+This sends the message and **waits** for the reply. The reply content will
+be printed to stdout when it arrives. Use `--timeout N` to set max wait time
+(default: 24 hours).
+
+## Rules
+
+- The command blocks until the target agent replies.
+- You can send to multiple agents sequentially.
+- Use `--no-wait` to send without waiting (fire and forget).
+''' + ASK_SKILL_COMMON
+
+CLAUDE_PING_SKILL = r'''---
+name: warp-ping
+description: Check if an AI agent is online. Always ping before using warp-ask.
+metadata:
+  short-description: Check AI agent online status
+---
+
+# Warp Ping - Check Agent Status
+
+Check if an AI agent is online and reachable via the CCB bus.
+
+## Discover All Online Agents
+
+```powershell
+warp-ping --list
+```
+
+Shows all online agents with their alias names. Use the alias as the target
+for `warp-ask`.
+
+## Ping a Specific Agent
+
+```powershell
+warp-ping $ALIAS
+```
+
+## Rules
+
+- Returns "online" if reachable, "offline" if unavailable.
+- Always check before sending messages with warp-ask.
+- If not online, do NOT attempt warp-ask.
+
+## Manual Registration
+
+Agents launched via `warp-ccb` are automatically registered in the SQLite bus.
+If an agent was started manually in a Warp pane, it can self-register:
+
+```powershell
+warp-ccb-register
+```
+'''
+
+BASH_PING_SKILL = r'''---
+name: warp-ping
+description: Check if an AI agent is online. Always ping before using warp-ask.
+metadata:
+  short-description: Check AI agent online status
+---
+
+# Warp Ping - Check Agent Status
+
+Check if an AI agent is online and reachable via the CCB bus.
+
+## Discover All Online Agents
+
+```bash
+warp-ping --list
+```
+
+Shows all online agents with their alias names. Use the alias as the target
+for `warp-ask`.
+
+## Ping a Specific Agent
+
+```bash
+warp-ping $ALIAS
+```
+
+## Rules
+
+- Returns "online" if reachable, "offline" if unavailable.
+- Always check before sending messages with warp-ask.
+- If not online, do NOT attempt warp-ask.
+
+## Manual Registration
+
+Agents launched via `warp-ccb` are automatically registered in the SQLite bus.
+If an agent was started manually in a Warp pane, it can self-register:
+
+```bash
+warp-ccb-register
+```
+'''
+
+CLAUDE_REPLY_SKILL = r'''---
+name: warp-reply
+description: Reply to an incoming CCB request using warp-reply CLI.
+metadata:
+  short-description: Reply to a CCB request
+---
+
+# Warp Reply - Submit Response
+
+You have received a CCB task identified by `[CCB_REQ_ID:<req_id>]`.
+After completing the task, submit your reply using `warp-reply`.
+
+## Submit Reply
+
+```powershell
+# Write reply to a file first, then submit
+Set-Content -Path "reply.md" -Value $REPLY
+warp-reply --req-id $REQ_ID --content-file reply.md
+
+# Or inline for short replies
+warp-reply --req-id $REQ_ID --content "Your reply here"
+```
+
+Parameters:
+- --req-id (required): The request ID from [CCB_REQ_ID:<id>]
+- --content-file: Path to file containing the reply
+- --content: Inline text for short replies
+'''
+
+BASH_REPLY_SKILL = r'''---
+name: warp-reply
+description: Reply to an incoming CCB request using warp-reply CLI.
+metadata:
+  short-description: Reply to a CCB request
+---
+
+# Warp Reply - Submit Response
+
+You have received a CCB task identified by `[CCB_REQ_ID:<req_id>]`.
+After completing the task, submit your reply using `warp-reply`.
+
+## Submit Reply
+
+```bash
+# Write reply to a file first, then submit
+warp-reply --req-id $REQ_ID --content-file reply.md
+
+# Or inline for short replies
+warp-reply --req-id $REQ_ID --content "Your reply here"
+```
+
+Parameters:
+- --req-id (required): The request ID from [CCB_REQ_ID:<id>]
+- --content-file: Path to file containing the reply
+- --content: Inline text for short replies
+'''
+
+
+def install_skills():
+    """Install warp-ask, warp-ping, and warp-reply skills for all supported agents."""
+    skills = [
+        ("warp-ask", CLAUDE_ASK_SKILL, BASH_ASK_SKILL),
+        ("warp-ping", CLAUDE_PING_SKILL, BASH_PING_SKILL),
+        ("warp-reply", CLAUDE_REPLY_SKILL, BASH_REPLY_SKILL),
+    ]
+
+    # Agent skill directories: (agent_name, path_func, shell_type)
+    # shell_type: 'powershell' for Claude, 'bash' for all others
+    agents = [
+        ("Claude", lambda: os.path.expanduser("~/.claude/skills"), "powershell"),
+        ("Codex", lambda: os.path.expanduser("~/.codex/skills"), "bash"),
+        ("Codex (agents)", lambda: os.path.expanduser("~/.agents/skills"), "bash"),
+        ("Droid", lambda: os.path.expanduser("~/.factory/skills"), "bash"),
+        ("Gemini", lambda: os.path.expanduser("~/.gemini/skills"), "bash"),
+        ("OpenCode", lambda: os.path.expanduser("~/.config/opencode/skills"), "bash"),
+        ("Kimi", lambda: os.path.expanduser("~/.kimi/skills"), "bash"),
+        ("Goose", lambda: os.path.expanduser("~/.config/goose/skills"), "bash"),
+    ]
+
+    installed_count = 0
+    for skill_name, claude_content, bash_content in skills:
+        for agent_name, path_fn, shell_type in agents:
+            skill_dir = os.path.join(path_fn(), skill_name)
+            try:
+                os.makedirs(skill_dir, exist_ok=True)
+                content = claude_content if shell_type == "powershell" else bash_content
+                with open(os.path.join(skill_dir, "SKILL.md"), "w", encoding="utf-8") as f:
+                    f.write(content)
+                installed_count += 1
+            except OSError as e:
+                print(f"  Skipped {agent_name}/{skill_name}: {e}")
+
+    print(f"Installed {installed_count} skill files across {len(agents)} agent directories")
+
+
+def add_to_path_windows(bin_dir):
+    """Add bin_dir to user PATH on Windows."""
+    import winreg
+    key = winreg.OpenKey(
+        winreg.HKEY_CURRENT_USER,
+        r"Environment",
+        0,
+        winreg.KEY_READ | winreg.KEY_WRITE,
+    )
+    try:
+        path_val, path_type = winreg.QueryValueEx(key, "Path")
+    except FileNotFoundError:
+        path_val = ""
+        path_type = winreg.REG_EXPAND_SZ
+
+    # Normalize to forward slashes for comparison
+    normalized = path_val.replace("/", "\\")
+    if bin_dir.lower().replace("/", "\\") not in normalized.lower():
+        new_path = path_val + ";" + bin_dir if path_val else bin_dir
+        winreg.SetValueEx(key, "Path", 0, path_type, new_path)
+        print(f"Added to user PATH: {bin_dir}")
+        # Notify running shells
+        os.system(f"setx PATH \"{new_path}\" >nul 2>&1")
+    else:
+        print(f"Already in PATH: {bin_dir}")
+
+    winreg.CloseKey(key)
+
+
+def add_to_path_unix(bin_dir):
+    """Add bin_dir to user PATH on Unix via shell rc file."""
+    shell_rc = os.path.expanduser("~/.bashrc")
+    export_line = f'\nexport PATH="$PATH:{bin_dir}"\n'
+
+    if os.path.exists(shell_rc):
+        with open(shell_rc, "r") as f:
+            content = f.read()
+        if bin_dir not in content:
+            with open(shell_rc, "a") as f:
+                f.write(export_line)
+            print(f"Added to ~/.bashrc: {bin_dir}")
+        else:
+            print(f"Already in ~/.bashrc: {bin_dir}")
+    else:
+        with open(shell_rc, "w") as f:
+            f.write(export_line)
+        print(f"Created ~/.bashrc with PATH: {bin_dir}")
+
+
+def main():
+    print("=== CCB Warp LocalAgentBus Setup ===\n")
+
+    # Resolve absolute path for bin dir
+    bin_dir = os.path.abspath(BIN_DIR)
+    print(f"Bridge bin directory: {bin_dir}")
+
+    # 1. Add to PATH
+    print("\n[1/2] Adding to PATH...")
+    if sys.platform == "win32":
+        add_to_path_windows(bin_dir)
+    else:
+        add_to_path_unix(bin_dir)
+
+    # 2. Install skills
+    print("\n[2/2] Installing skills...")
+    install_skills()
+
+    print("\n=== Setup Complete ===")
+    print("Restart your terminal for PATH changes to take effect.")
+    print("Installed skills: warp-ask, warp-ping, warp-reply")
+    print("Target agents: Claude, Codex, Droid, Gemini, OpenCode, Kimi, Goose")
+    print("Default bus mode: SQLite (no Warp dependency)")
+    print("Then run: warp-ping claude")
+
+
+if __name__ == "__main__":
+    main()

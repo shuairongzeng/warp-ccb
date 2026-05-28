@@ -1,0 +1,109 @@
+#!/usr/bin/env python
+"""warp-pend — View latest replies from a CLI agent
+
+Supports two modes:
+  --mode tcp     : Use TCP JSONL bus (original)
+  --mode sqlite  : Use SQLite bus (default)
+  --mode dual    : Try SQLite first
+"""
+
+import sys
+import os
+import json
+
+if sys.stdout and hasattr(sys.stdout, 'reconfigure'):
+    try:
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    except Exception:
+        pass
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "lib"))
+
+
+def main():
+    if len(sys.argv) < 2:
+        print("Usage: warp-pend <provider> [--count N] [--req-id <id>] [--cwd <dir>] [--mode <tcp|sqlite|dual>]")
+        print("Providers: claude, codex, gemini, opencode, droid, kimi, goose")
+        sys.exit(1)
+
+    provider = sys.argv[1]
+    count = 1
+    req_id = None
+    cwd = None
+    mode = "sqlite"
+
+    i = 2
+    while i < len(sys.argv):
+        if sys.argv[i] == "--count" and i + 1 < len(sys.argv):
+            count = int(sys.argv[i + 1])
+            i += 2
+        elif sys.argv[i] == "--req-id" and i + 1 < len(sys.argv):
+            req_id = sys.argv[i + 1]
+            i += 2
+        elif sys.argv[i] == "--cwd" and i + 1 < len(sys.argv):
+            cwd = sys.argv[i + 1]
+            i += 2
+        elif sys.argv[i] == "--mode" and i + 1 < len(sys.argv):
+            mode = sys.argv[i + 1]
+            i += 2
+        else:
+            i += 1
+
+    try:
+        # --- SQLite path ---
+        if mode in ("sqlite", "dual"):
+            from bus_sqlite import BusDB
+            db = BusDB(cwd=cwd)
+            # Bridge any TCP replies into SQLite before querying
+            try:
+                db.sync_from_tcp()
+            except Exception:
+                pass
+            replies = db.pend(provider, count=count, req_id=req_id)
+            # Consume ONLY reply_ready notifications so they don't pile up.
+            # Must NOT touch new_request notifs — those belong to ccb-worker.
+            try:
+                db.get_notifications(provider, consume=True, notif_type='reply_ready')
+            except Exception:
+                pass
+            db.close()
+            if not replies:
+                print(f"No replies for {provider}")
+            for r in replies:
+                status = r.get("status", "unknown")
+                content = r.get("content", "")
+                rid = r.get('req_id', '?')
+                if content:
+                    print(f"[{rid}] ({status})")
+                    print(content)
+                else:
+                    print(f"[{rid}] ({status}) <empty reply>")
+            return
+
+        # --- TCP path ---
+        if mode == "tcp":
+            from bus_client import pend
+            response = pend(provider, count=count, req_id=req_id, cwd=cwd)
+            if response.get("ok"):
+                replies = response.get("replies", [])
+                if not replies:
+                    print(f"No replies from {provider}")
+                for reply in replies:
+                    status = reply.get("status", "unknown")
+                    content = reply.get("content", "")
+                    req_id_str = reply.get('req_id', '?')
+                    if content:
+                        print(f"[{req_id_str}] ({status})")
+                        print(content)
+                    else:
+                        print(f"[{req_id_str}] ({status}) <empty reply>")
+            else:
+                print(f"Error: {response.get('message', 'unknown error')}", file=sys.stderr)
+                sys.exit(1)
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
